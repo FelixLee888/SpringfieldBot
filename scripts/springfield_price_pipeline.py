@@ -33,6 +33,7 @@ BRIGHTDATA_SERP_COUNTRY = os.getenv("SPRINGFIELD_PRICE_BRIGHTDATA_SERP_COUNTRY",
 BRIGHTDATA_SERP_HOST = os.getenv("SPRINGFIELD_PRICE_BRIGHTDATA_SERP_HOST", "www.google.com").strip() or "www.google.com"
 BRIGHTDATA_SERP_LANGUAGE = os.getenv("SPRINGFIELD_PRICE_BRIGHTDATA_SERP_LANGUAGE", "en").strip() or "en"
 BRIGHTDATA_SERP_GEO = os.getenv("SPRINGFIELD_PRICE_BRIGHTDATA_SERP_GEO", "gb").strip() or "gb"
+TROLLEY_BASE_URL = "https://www.trolley.co.uk/"
 DEFAULT_USER_AGENT = os.getenv(
     "SPRINGFIELD_PRICE_USER_AGENT",
     "Mozilla/5.0 (compatible; SpringfieldPriceBot/2.0; +https://t.me/Springfield_Price_Bot)",
@@ -77,6 +78,13 @@ SINGLE_MEASURE_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*(kg|g|oz|lb|l|litre|liter|m
 COUNT_PACK_RE = re.compile(r"\b(?:pack\s+of\s+)?(\d+)\s*(?:pack|packs|pk|pcs?|pieces?|eggs?|bottles?|cans?)\b", re.IGNORECASE)
 COUNT_TAIL_RE = re.compile(r"\bx\s*(\d+)\s*$", re.IGNORECASE)
 TEXT_AVAILABILITY_RE = re.compile(r"\b(in stock|out of stock|available|unavailable)\b", re.IGNORECASE)
+TROLLEY_PRODUCT_LINK_RE = re.compile(r'href="(/product/[^"]+)"')
+TROLLEY_BRAND_RE = re.compile(r'<div class="_brand">([^<]+)</div>', re.IGNORECASE)
+TROLLEY_DESC_RE = re.compile(r'<div class="_desc">([^<]+)</div>', re.IGNORECASE)
+TROLLEY_OFFER_RE = re.compile(
+    r'<div class="_item">.*?class="store-logo\s+-([^"\s]+)[^"]*".*?<div class="_price">\s*<b>&pound;([0-9]+(?:\.[0-9]{1,2})?)</b>',
+    re.IGNORECASE | re.DOTALL,
+)
 LOCAL_FILE_FALSE_VALUES = {"0", "false", "no", "off"}
 _CACHE_DISABLED_VALUES = {"0", "false", "no", "off"}
 _CACHE_NAMESPACE_TTLS = {
@@ -84,6 +92,7 @@ _CACHE_NAMESPACE_TTLS = {
     "json_url": "SPRINGFIELD_PRICE_CACHE_JSON_TTL_SEC",
     "pricesapi_json": "SPRINGFIELD_PRICE_CACHE_API_TTL_SEC",
     "brightdata_shopping": "SPRINGFIELD_PRICE_CACHE_API_TTL_SEC",
+    "item_lookup_result": "SPRINGFIELD_PRICE_CACHE_ITEM_TTL_SEC",
 }
 
 QUERY_LABELS = {
@@ -116,13 +125,14 @@ VALUE_KEYWORDS = {"best", "value", "cheapest", "cheap", "lowest", "compare", "co
 LIVE_PRICE_KEYWORDS = {"today", "current", "currently", "live", "now", "this", "week"}
 OFFICIAL_ONLY_KEYWORDS = {"official", "government", "ons", "gov", "govuk", "defra"}
 PACKAGE_QUERY_TERMS = {"bag", "bags", "bottle", "bottles", "box", "boxes", "carton", "cartons", "case", "cases", "pack", "packs", "packet", "packets", "tray", "trays"}
-EGG_QUERY_EXCLUDED_TERMS = {"cadbury", "chocolate", "creme", "easter", "mini", "scotch", "savoury", "surprise"}
+EGG_QUERY_EXCLUDED_TERMS = {"cadbury", "chocolate", "creme", "duck", "easter", "mini", "quail", "scotch", "savoury", "surprise"}
 QUERY_NOISE = {
     "a",
     "an",
     "and",
     "across",
     "are",
+    "am",
     "before",
     "buy",
     "best",
@@ -132,7 +142,10 @@ QUERY_NOISE = {
     "cost",
     "current",
     "data",
+    "dinner",
     "checking",
+    "cook",
+    "cooking",
     "find",
     "food",
     "for",
@@ -150,6 +163,8 @@ QUERY_NOISE = {
     "only",
     "official",
     "on",
+    "prepare",
+    "preparing",
     "price",
     "prices",
     "retail",
@@ -163,6 +178,11 @@ QUERY_NOISE = {
     "the",
     "this",
     "to",
+    "breakfast",
+    "lunch",
+    "meal",
+    "meals",
+    "tonight",
     "want",
     "uk",
     "up",
@@ -328,6 +348,24 @@ CANONICAL_RETAILER_NAMES = {
     "sains": "Sainsbury's",
     "sainsburys": "Sainsbury's",
     "tesco": "Tesco",
+    "tescogroceries": "Tesco",
+    "marksandspencer": "M&S",
+    "mands": "M&S",
+    "morrisonsdaily": "Morrisons",
+    "waitrose": "Waitrose",
+}
+TROLLEY_STORE_CLASS_MAP = {
+    "aldi": "Aldi",
+    "asda": "ASDA",
+    "coop": "Co-op",
+    "co-op": "Co-op",
+    "iceland": "Iceland",
+    "lidl": "Lidl",
+    "morrisons": "Morrisons",
+    "morrisonsdaily": "Morrisons",
+    "ocado": "Ocado",
+    "sainsburys": "Sainsbury's",
+    "tesco": "Tesco",
     "waitrose": "Waitrose",
 }
 RETAILER_HOST_NAMES = {
@@ -342,16 +380,26 @@ RETAILER_HOST_NAMES = {
 }
 MERCHANT_SEARCH_SOURCES = (
     {
+        "name": "Trolley",
+        "search_url": "https://www.trolley.co.uk/search/?from=search&q={query}",
+        "product_base_url": "https://www.trolley.co.uk/",
+        "parser": "trolley_search_html",
+        "allow_broad_terms": True,
+        "supports_retailer_lookup": True,
+    },
+    {
         "name": "Tom Hixson",
         "search_url": "https://tomhixson.co.uk/search?q={query}&options%5Bprefix%5D=last&type=product",
         "product_base_url": "https://tomhixson.co.uk/products/",
         "parser": "wlfdn_shopify",
+        "allow_broad_terms": False,
     },
     {
         "name": "Fine Food Specialist",
         "search_url": "https://www.finefoodspecialist.co.uk/search?q={query}&type=product",
         "product_base_url": "https://www.finefoodspecialist.co.uk/products/",
         "parser": "shopify_meta",
+        "allow_broad_terms": False,
     },
     {
         "name": "Costco",
@@ -360,7 +408,8 @@ MERCHANT_SEARCH_SOURCES = (
         "product_base_url": "https://www.costco.co.uk/",
         "parser": "costco_rest_json",
         "response_type": "json",
-        "min_search_terms": 2,
+        "min_search_terms": 1,
+        "allow_broad_terms": False,
     },
 )
 WLFDN_PRODUCT_PUSH_RE = re.compile(r'_WLFDN\.shopify\.product_data\.push\((\{.*?\})\);', re.DOTALL)
@@ -369,6 +418,7 @@ WLFDN_NAME_RE = re.compile(r'"item_name"\s*:\s*"([^"]+)"')
 WLFDN_PRICE_RE = re.compile(r'"price"\s*:\s*"([^"]+)"')
 MERCHANT_EXCLUDED_TERMS = {"box", "bundle", "dripping", "fat", "gin", "hamper", "pie", "sauce", "seasoning"}
 MERCHANT_PRODUCT_PAGE_FETCH_LIMIT = max(1, int(os.getenv("SPRINGFIELD_PRICE_MERCHANT_PAGE_FETCH_LIMIT", "4")))
+TROLLEY_PRODUCT_FETCH_LIMIT = max(1, int(os.getenv("SPRINGFIELD_PRICE_TROLLEY_PRODUCT_FETCH_LIMIT", "6")))
 
 
 def read_stdin() -> str:
@@ -513,6 +563,59 @@ def cache_put(namespace: str, payload: Dict[str, Any], body_text: str, response_
         connection.commit()
     finally:
         connection.close()
+
+
+LIVE_ITEM_LOOKUP_SOURCE_KEYS = {
+    "retailer_search_pages",
+    "pricesapi_live_offers",
+    "brightdata_google_shopping",
+}
+
+
+def item_lookup_cache_payload(plan: Dict[str, Any], search_terms: List[str]) -> Dict[str, Any]:
+    return {
+        "query_type": str(plan.get("query_type") or ""),
+        "search_terms": search_terms,
+        "requested_pack_count": plan.get("requested_pack_count"),
+        "retailers": [str(item) for item in plan.get("retailers", []) if str(item).strip()],
+        "official_only": bool(plan.get("official_only")),
+    }
+
+
+def load_cached_item_lookup(plan: Dict[str, Any], search_terms: List[str]) -> List[Dict[str, Any]]:
+    cached = cache_get("item_lookup_result", item_lookup_cache_payload(plan, search_terms))
+    if cached is None:
+        return []
+    body_text, _ = cached
+    try:
+        payload = json.loads(body_text)
+    except ValueError:
+        return []
+    offers = payload.get("offers")
+    if not isinstance(offers, list):
+        return []
+    restored: List[Dict[str, Any]] = []
+    for offer in offers:
+        if not isinstance(offer, dict):
+            continue
+        restored_offer = dict(offer)
+        restored_offer["cache_hit"] = True
+        restored.append(restored_offer)
+    return restored
+
+
+def store_cached_item_lookup(plan: Dict[str, Any], search_terms: List[str], offers: List[Dict[str, Any]]) -> None:
+    if not offers:
+        return
+    source_key = str(offers[0].get("lookup_source_key") or "")
+    if source_key not in LIVE_ITEM_LOOKUP_SOURCE_KEYS:
+        return
+    cache_put(
+        "item_lookup_result",
+        item_lookup_cache_payload(plan, search_terms),
+        json.dumps({"offers": offers}, sort_keys=True),
+        str(offers[0].get("lookup_source_url") or ""),
+    )
 
 
 def first_existing_path(text: str) -> Optional[Path]:
@@ -1773,12 +1876,16 @@ def should_try_live_merchant_lookup(plan: Dict[str, Any], search_terms: List[str
     if not search_terms:
         return False
     if plan.get("retailers"):
+        if any(bool(source.get("supports_retailer_lookup")) for source in MERCHANT_SEARCH_SOURCES):
+            return True
         merchant_keys = {
             normalize_retailer_key(str(source.get("retailer") or source.get("name") or ""))
             for source in MERCHANT_SEARCH_SOURCES
             if str(source.get("retailer") or source.get("name") or "").strip()
         }
         return bool(requested_retailer_keys(plan) & merchant_keys)
+    if plan.get("requested_pack_count") is not None:
+        return True
     return len(search_terms) >= 2 or search_terms[0] not in BROAD_ITEM_TERMS
 
 
@@ -1924,6 +2031,73 @@ def parse_shopify_meta_results(
     return offers
 
 
+def trolley_retailer_from_store_class(store_class: str) -> str:
+    normalized = normalize_retailer_key(store_class.replace("-", " "))
+    mapped = TROLLEY_STORE_CLASS_MAP.get(normalized)
+    if mapped:
+        return mapped
+    return retailer_display_name(store_class)
+
+
+def parse_trolley_product_page_results(
+    html_text: str,
+    product_url: str,
+    search_terms: List[str],
+    requested_pack_count: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    brand_match = TROLLEY_BRAND_RE.search(html_text)
+    desc_match = TROLLEY_DESC_RE.search(html_text)
+    brand = html.unescape(brand_match.group(1)).strip() if brand_match else ""
+    description = html.unescape(desc_match.group(1)).strip() if desc_match else ""
+    product_name = " ".join(part for part in (brand, description) if part).strip()
+    if not product_name:
+        product_name = str(extract_from_title(html_text).get("product_name") or "").strip()
+    offers: List[Dict[str, Any]] = []
+    for store_class, price_text in TROLLEY_OFFER_RE.findall(html_text):
+        retailer = trolley_retailer_from_store_class(store_class)
+        offer = collect_live_offer(
+            retailer,
+            product_name,
+            parse_amount(price_text),
+            product_url,
+            search_terms,
+            requested_pack_count=requested_pack_count,
+        )
+        if offer is None:
+            continue
+        offer["lookup_source_name"] = "Trolley supermarket comparison"
+        offer["lookup_source_url"] = TROLLEY_BASE_URL
+        offers.append(offer)
+    return offers
+
+
+def parse_trolley_search_results(
+    html_text: str,
+    source: Dict[str, str],
+    search_terms: List[str],
+    requested_pack_count: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    product_paths = ordered_unique(TROLLEY_PRODUCT_LINK_RE.findall(html_text))
+    if not product_paths:
+        return []
+    offers: List[Dict[str, Any]] = []
+    for product_path in product_paths[:TROLLEY_PRODUCT_FETCH_LIMIT]:
+        product_url = urljoin(source["product_base_url"], html.unescape(product_path).strip())
+        try:
+            product_html, final_url = fetch_url(product_url)
+        except Exception:
+            continue
+        offers.extend(
+            parse_trolley_product_page_results(
+                product_html,
+                str(final_url or product_url).strip(),
+                search_terms,
+                requested_pack_count=requested_pack_count,
+            )
+        )
+    return offers
+
+
 def extract_live_product_page_data(url: str) -> Dict[str, Any]:
     try:
         html_text, final_url = fetch_url(url)
@@ -2040,8 +2214,10 @@ def parse_costco_rest_results(
 def find_live_merchant_offers(plan: Dict[str, Any], search_terms: List[str]) -> List[Dict[str, Any]]:
     if not should_try_live_merchant_lookup(plan, search_terms):
         return []
+    broad_term_query = not plan.get("retailers") and len(search_terms) == 1 and search_terms[0] in BROAD_ITEM_TERMS
     query = quote_plus(" ".join(search_terms))
     parsers = {
+        "trolley_search_html": parse_trolley_search_results,
         "wlfdn_shopify": parse_wlfdn_shopify_results,
         "shopify_meta": parse_shopify_meta_results,
         "costco_rest_json": parse_costco_rest_results,
@@ -2049,7 +2225,10 @@ def find_live_merchant_offers(plan: Dict[str, Any], search_terms: List[str]) -> 
     best_by_retailer: Dict[str, Dict[str, Any]] = {}
     for source in MERCHANT_SEARCH_SOURCES:
         source_retailer = str(source.get("retailer") or source.get("name") or "").strip()
-        if plan.get("retailers") and source_retailer and not retailer_requested(plan, source_retailer):
+        supports_retailer_lookup = bool(source.get("supports_retailer_lookup"))
+        if plan.get("retailers") and source_retailer and not retailer_requested(plan, source_retailer) and not supports_retailer_lookup:
+            continue
+        if broad_term_query and not bool(source.get("allow_broad_terms", False)):
             continue
         if not plan.get("retailers") and len(search_terms) < int(source.get("min_search_terms", 1)):
             continue
@@ -2068,6 +2247,8 @@ def find_live_merchant_offers(plan: Dict[str, Any], search_terms: List[str]) -> 
             continue
         for offer in parsed_offers:
             retailer = str(offer.get("retailer") or "Unknown retailer")
+            if not retailer_requested(plan, retailer):
+                continue
             best_by_retailer[retailer] = better_retailer_offer(best_by_retailer.get(retailer), offer)
     if not best_by_retailer:
         return []
@@ -2121,16 +2302,25 @@ def find_direct_item_offers(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not should_try_direct_item_lookup(plan):
         return []
     search_terms = extract_item_terms(plan)
-    csv_offers = find_csv_direct_item_offers(plan, search_terms)
+    cached_offers = load_cached_item_lookup(plan, search_terms)
+    if cached_offers:
+        return cached_offers
     live_offers = find_live_merchant_offers(plan, search_terms)
     if live_offers:
+        store_cached_item_lookup(plan, search_terms, live_offers)
         return live_offers
+    csv_offers = find_csv_direct_item_offers(plan, search_terms)
     pricesapi_offers = find_pricesapi_offers(plan, search_terms, csv_offers)
     if pricesapi_offers:
+        store_cached_item_lookup(plan, search_terms, pricesapi_offers)
         return pricesapi_offers
     brightdata_offers = find_brightdata_shopping_offers(plan, search_terms, csv_offers)
     if brightdata_offers:
+        store_cached_item_lookup(plan, search_terms, brightdata_offers)
         return brightdata_offers
+    if csv_offers:
+        for offer in csv_offers:
+            offer["live_lookup_attempted"] = True
     return csv_offers
 
 
@@ -2174,6 +2364,8 @@ def build_direct_item_reply(plan: Dict[str, Any], offers: List[Dict[str, Any]]) 
     terms = extract_item_terms(plan)
     source_key = direct_lookup_source_key(offers)
     source_url = direct_lookup_source_url(offers)
+    cache_hit = any(bool(offer.get("cache_hit")) for offer in offers)
+    live_lookup_attempted = any(bool(offer.get("live_lookup_attempted")) for offer in offers)
     lines = [f"Need: {plan['query_label']}"]
     if terms:
         lines.append(f"Search terms: {', '.join(terms)}")
@@ -2187,15 +2379,17 @@ def build_direct_item_reply(plan: Dict[str, Any], offers: List[Dict[str, Any]]) 
             lines.append(f"CSV-shortlisted retailers: {', '.join(str(item) for item in shortlist)}")
             lines.append("")
         if source_key == "pricesapi_live_offers":
-            lines.append("Latest live offers from PricesAPI:")
+            lines.append("Recent cached live offers from PricesAPI:" if cache_hit else "Latest live offers from PricesAPI:")
         else:
-            lines.append("Latest live offers from Bright Data Google Shopping:")
+            lines.append("Recent cached live offers from Bright Data Google Shopping:" if cache_hit else "Latest live offers from Bright Data Google Shopping:")
         if missing:
             lines.append(f"Live results not matched for: {', '.join(str(item) for item in missing)}")
     elif source_key == "retailer_search_pages":
-        lines.append("Best matched live offers from retailer search pages:")
+        lines.append("Recent cached live offers from retailer search pages:" if cache_hit else "Best matched live offers from retailer search pages:")
     else:
         lines.append("Best retailer matches from community dataset:")
+        if live_lookup_attempted:
+            lines.append("Live retailer checks ran first but did not return a qualifying current match for this query.")
     lines.append(f"Comparison basis: {direct_lookup_comparison_basis(offers)}")
     for idx, offer in enumerate(offers, start=1):
         price_text = format_amount("GBP", offer.get("price_gbp"))
@@ -2222,7 +2416,7 @@ def build_direct_item_reply(plan: Dict[str, Any], offers: List[Dict[str, Any]]) 
     if source_key == "pricesapi_live_offers":
         lines.extend(
             [
-                "- The retailer shortlist comes from the local Kaggle-derived CSV snapshot, then PricesAPI checks live offers for the shortlisted retailers when it can match them.",
+                "- Reused a recent cached item lookup for the same query to reduce repeated API calls; prices may have changed since that fetch." if cache_hit else "- The retailer shortlist comes from the local Kaggle-derived CSV snapshot, then PricesAPI checks live offers for the shortlisted retailers when it can match them.",
                 "- PricesAPI uses its own product catalog and seller coverage, so some UK grocery retailers may not appear even if they were shortlisted from the CSV.",
                 "- Verify the retailer page before checkout if the exact pack size or delivery terms matter.",
             ]
@@ -2230,7 +2424,7 @@ def build_direct_item_reply(plan: Dict[str, Any], offers: List[Dict[str, Any]]) 
     elif source_key == "brightdata_google_shopping":
         lines.extend(
             [
-                "- The retailer shortlist comes from the local Kaggle-derived CSV snapshot, then Bright Data checks fresher Google Shopping offers for those retailers.",
+                "- Reused a recent cached item lookup for the same query to reduce repeated API calls; prices may have changed since that fetch." if cache_hit else "- The retailer shortlist comes from the local Kaggle-derived CSV snapshot, then Bright Data checks fresher Google Shopping offers for those retailers.",
                 "- Coverage depends on Google Shopping and merchant-feed availability, so some shortlisted retailers may not return a live match.",
                 "- Verify the retailer page before checkout if the exact pack size or delivery terms matter.",
             ]
@@ -2238,7 +2432,7 @@ def build_direct_item_reply(plan: Dict[str, Any], offers: List[Dict[str, Any]]) 
     elif source_key == "retailer_search_pages":
         lines.extend(
             [
-                "- These are live retailer search-page matches, so availability and pricing can change between search and checkout.",
+                "- Reused a recent cached item lookup for the same query to reduce repeated crawling; prices may have changed since that fetch." if cache_hit else "- These are live retailer search-page matches, so availability and pricing can change between search and checkout.",
                 "- Result quality depends on each retailer site matching the item terms you sent.",
                 "- Send a public product page URL if you want an exact live page-price extraction for one specific item.",
             ]

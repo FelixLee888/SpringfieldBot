@@ -15,6 +15,7 @@ Forbidden behavior:
 - Do not guess prices or datasets without running the pipeline.
 - Do not say you are "checking" or "processing" before tool output is available.
 - Do not paraphrase the pipeline `reply_message` when it exists.
+- Do not summarize, reorder, reformat, or unit-convert any pipeline output fields.
 - Do not read arbitrary local file paths from public chat input.
 
 ## Command
@@ -30,9 +31,11 @@ __SPRINGFIELD_PRICE_PAYLOAD__
 
 ## Response Contract
 Always prefer `reply_message` from the pipeline JSON.
+Treat the pipeline as the renderer of final user text. You are a transport layer for `reply_message`.
 
-- If `reply_message` exists and is non-empty: send it verbatim and nothing else.
+- If `reply_message` exists and is non-empty: send exactly that string byte-for-byte, with the same line breaks, and nothing else.
 - If the pipeline returns an error and no `reply_message`: give a brief, concrete error.
+- Forbidden in final reply when `reply_message` exists: added intro sentence, added note, removed caveat, rewritten list numbering, rewritten units, rewritten dates.
 - If the user is outside scope: say the bot handles UK food price questions plus public product URLs / pasted HTML.
 
 ## Scope

@@ -50,11 +50,14 @@ class SpringfieldPricePipelineTest(unittest.TestCase):
 
     def test_retailer_query_prefers_community_dataset(self):
         old_path = module.COMMUNITY_DATASET_CSV_PATH
+        old_direct = module.find_direct_item_offers
         module.COMMUNITY_DATASET_CSV_PATH = ROOT / "tests" / "fixtures" / "missing-community.csv"
+        module.find_direct_item_offers = lambda plan: []
         try:
             result = module.analyze_payload("Where can I compare the best value eggs across Tesco, Asda and Sainsburys this week?")
         finally:
             module.COMMUNITY_DATASET_CSV_PATH = old_path
+            module.find_direct_item_offers = old_direct
         self.assertTrue(result.ok)
         self.assertEqual(result.mode, "query")
         self.assertEqual(result.query_type, "retailer_comparison")
@@ -582,6 +585,95 @@ class SpringfieldPricePipelineTest(unittest.TestCase):
         self.assertIn("Link: https://www.finefoodspecialist.co.uk/products/wagyu-short-rib", result.reply_message)
         self.assertIn("live retailer search-page matches", result.reply_message)
 
+    def test_trolley_parser_extracts_supermarket_offers(self):
+        search_html = """
+        <div class="product-item">
+          <a href="/product/tesco-medium-free-range-eggs/BTC840" title="Tesco Medium Free Range Eggs x12"></a>
+        </div>
+        """
+        product_html = """
+        <div class="_brand">Tesco</div>
+        <div class="_desc">Medium Free Range Eggs x12</div>
+        <div class="_item">
+          <svg class="store-logo -tesco"></svg>
+          <div class="_price"><b>&pound;2.85</b></div>
+        </div>
+        <div class="_item">
+          <svg class="store-logo -asda"></svg>
+          <div class="_price"><b>&pound;2.60</b></div>
+        </div>
+        """
+        old_fetch = module.fetch_url
+
+        def fake_fetch(url: str):
+            if "trolley.co.uk/product/tesco-medium-free-range-eggs/BTC840" in url:
+                return product_html, url
+            raise AssertionError(url)
+
+        module.fetch_url = fake_fetch
+        try:
+            offers = module.parse_trolley_search_results(
+                search_html,
+                {
+                    "name": "Trolley",
+                    "search_url": "https://www.trolley.co.uk/search/?from=search&q={query}",
+                    "product_base_url": "https://www.trolley.co.uk/",
+                },
+                ["eggs"],
+                requested_pack_count=12,
+            )
+        finally:
+            module.fetch_url = old_fetch
+        self.assertEqual(len(offers), 2)
+        by_retailer = {offer["retailer"]: offer for offer in offers}
+        self.assertIn("Tesco", by_retailer)
+        self.assertIn("ASDA", by_retailer)
+        self.assertEqual(by_retailer["Tesco"]["price_gbp"], 2.85)
+        self.assertEqual(by_retailer["ASDA"]["price_gbp"], 2.6)
+        self.assertEqual(by_retailer["Tesco"]["lookup_source_url"], "https://www.trolley.co.uk/")
+
+    def test_trolley_live_supermarket_results_precede_csv_fallback(self):
+        search_html = """
+        <div class="product-item">
+          <a href="/product/tesco-medium-free-range-eggs/BTC840" title="Tesco Medium Free Range Eggs x12"></a>
+        </div>
+        """
+        product_html = """
+        <div class="_brand">Tesco</div>
+        <div class="_desc">Medium Free Range Eggs x12</div>
+        <div class="_item">
+          <svg class="store-logo -tesco"></svg>
+          <div class="_price"><b>&pound;2.85</b></div>
+        </div>
+        """
+        old_fetch = module.fetch_url
+        old_fetch_json = module.fetch_json_url
+        old_path = module.COMMUNITY_DATASET_CSV_PATH
+        module.COMMUNITY_DATASET_CSV_PATH = ROOT / "tests" / "fixtures" / "missing-community.csv"
+
+        def fake_fetch(url: str):
+            if "trolley.co.uk/search/" in url:
+                return search_html, url
+            if "trolley.co.uk/product/tesco-medium-free-range-eggs/BTC840" in url:
+                return product_html, url
+            if "finefoodspecialist.co.uk" in url or "tomhixson.co.uk" in url:
+                return "", url
+            raise AssertionError(url)
+
+        module.fetch_url = fake_fetch
+        module.fetch_json_url = lambda url: ({"products": []}, url)
+        try:
+            result = module.analyze_payload("What is the Tesco eggs price?")
+        finally:
+            module.fetch_url = old_fetch
+            module.fetch_json_url = old_fetch_json
+            module.COMMUNITY_DATASET_CSV_PATH = old_path
+        self.assertTrue(result.ok)
+        self.assertEqual(result.source, "Trolley supermarket comparison")
+        self.assertIn("Retailers mentioned: Tesco", result.reply_message)
+        self.assertIn("Tesco: Tesco Medium Free Range Eggs x12 - £2.85", result.reply_message)
+        self.assertIn("Source: https://www.trolley.co.uk/", result.reply_message)
+
     def test_csv_snapshot_lookup_returns_best_matches_when_live_search_unavailable(self):
         with TemporaryDirectory() as tmpdir:
             csv_path = Path(tmpdir) / "community_supermarket_latest.csv"
@@ -617,16 +709,73 @@ class SpringfieldPricePipelineTest(unittest.TestCase):
                 encoding="utf-8",
             )
             old_path = module.COMMUNITY_DATASET_CSV_PATH
+            old_fetch = module.fetch_url
             module.COMMUNITY_DATASET_CSV_PATH = csv_path
+            module.fetch_url = lambda url: (_ for _ in ()).throw(RuntimeError("offline"))
             try:
                 result = module.analyze_payload("Where can I compare the best value eggs across Tesco and ASDA this week?")
             finally:
                 module.COMMUNITY_DATASET_CSV_PATH = old_path
+                module.fetch_url = old_fetch
         self.assertTrue(result.ok)
         self.assertIn("Retailers mentioned: Tesco, ASDA", result.reply_message)
         self.assertIn("Tesco Eggs - £2.60 (£5.20/dozen)", result.reply_message)
         self.assertIn("ASDA Eggs - £2.40 (£4.80/dozen)", result.reply_message)
         self.assertNotIn("Morrisons Eggs", result.reply_message)
+
+    def test_requested_pack_count_allows_live_lookup_for_broad_egg_query(self):
+        plan = module.classify_query("I want to buy a box of 12 eggs")
+        terms = module.extract_item_terms(plan)
+        self.assertEqual(terms, ["eggs"])
+        self.assertTrue(module.should_try_live_merchant_lookup(plan, terms))
+
+    def test_conversational_egg_query_ignores_meal_prep_noise(self):
+        plan = module.classify_query("I am preparing dinner, I want to buy a box of 12 eggs")
+        self.assertIn("eggs", plan["focus_terms"])
+        self.assertNotIn("preparing", plan["focus_terms"])
+        self.assertNotIn("dinner", plan["focus_terms"])
+
+    def test_cached_item_lookup_short_circuits_live_and_csv(self):
+        old_cache_get = module.cache_get
+        old_live = module.find_live_merchant_offers
+        old_csv = module.find_csv_direct_item_offers
+
+        def fake_cache_get(namespace, payload):
+            if namespace != "item_lookup_result":
+                return None
+            return (
+                module.json.dumps({
+                    "offers": [
+                        {
+                            "retailer": "Costco",
+                            "product_name": "Shen Dan Boiled Salted Duck Eggs x 12",
+                            "price_gbp": 5.49,
+                            "price_unit_gbp": 0.46,
+                            "unit": "each",
+                            "score": 4,
+                            "product_url": "https://www.costco.co.uk/example-eggs",
+                            "lookup_source_key": "retailer_search_pages",
+                            "lookup_source_name": "Retailer search pages",
+                            "lookup_source_url": "",
+                        }
+                    ]
+                }, sort_keys=True),
+                "",
+            )
+
+        module.cache_get = fake_cache_get
+        module.find_live_merchant_offers = lambda plan, terms: (_ for _ in ()).throw(AssertionError("live lookup should not run"))
+        module.find_csv_direct_item_offers = lambda plan, terms: (_ for _ in ()).throw(AssertionError("csv lookup should not run"))
+        try:
+            result = module.analyze_payload("I want to buy a box of 12 eggs")
+        finally:
+            module.cache_get = old_cache_get
+            module.find_live_merchant_offers = old_live
+            module.find_csv_direct_item_offers = old_csv
+        self.assertTrue(result.ok)
+        self.assertEqual(result.source, "Retailer search pages")
+        self.assertIn("Recent cached live offers from retailer search pages", result.reply_message)
+        self.assertIn("Shen Dan Boiled Salted Duck Eggs x 12 - £5.49 (£0.46/each)", result.reply_message)
 
     def test_box_of_12_eggs_prefers_real_egg_packs(self):
         with TemporaryDirectory() as tmpdir:
@@ -635,6 +784,7 @@ class SpringfieldPricePipelineTest(unittest.TestCase):
                 "supermarket_name,price_gbp,price_unit_gbp,unit,product_name,normalized_product_name,capture_date,category_name,is_own_brand\n"
                 "ASDA,2.4,4.8,dozen,ASDA Eggs,asda eggs,2024-04-11T00:00:00,fresh_food,true\n"
                 "Tesco,3.5,7.0,kg,Cadbury Creme Eggs 48 x 40g,cadbury creme eggs 48 x 40g,2024-04-10T00:00:00,food_cupboard,false\n"
+                "Costco,5.49,0.46,each,Shen Dan Boiled Salted Duck Eggs x 12,shen dan boiled salted duck eggs x 12,2024-04-10T00:00:00,fresh_food,false\n"
                 "Sains,5.0,5.0,unit,A Dozen Red Roses,a dozen red roses,2024-04-09T00:00:00,fresh_food,false\n",
                 encoding="utf-8",
             )
@@ -650,8 +800,10 @@ class SpringfieldPricePipelineTest(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(result.source, "Community UK supermarket time-series dataset")
         self.assertIn("Search terms: eggs", result.reply_message)
+        self.assertIn("Live retailer checks ran first but did not return a qualifying current match for this query.", result.reply_message)
         self.assertIn("ASDA Eggs - £2.40 (£4.80/dozen)", result.reply_message)
         self.assertNotIn("Cadbury Creme Eggs", result.reply_message)
+        self.assertNotIn("Shen Dan Boiled Salted Duck Eggs", result.reply_message)
         self.assertNotIn("A Dozen Red Roses", result.reply_message)
 
     def test_csv_snapshot_skips_non_food_categories(self):
@@ -664,11 +816,14 @@ class SpringfieldPricePipelineTest(unittest.TestCase):
                 encoding="utf-8",
             )
             old_path = module.COMMUNITY_DATASET_CSV_PATH
+            old_fetch = module.fetch_url
             module.COMMUNITY_DATASET_CSV_PATH = csv_path
+            module.fetch_url = lambda url: (_ for _ in ()).throw(RuntimeError("offline"))
             try:
                 result = module.analyze_payload("Where can I compare the best value eggs across ASDA this week?")
             finally:
                 module.COMMUNITY_DATASET_CSV_PATH = old_path
+                module.fetch_url = old_fetch
         self.assertTrue(result.ok)
         self.assertIn("ASDA Eggs - £2.40 (£4.80/dozen)", result.reply_message)
         self.assertNotIn("George Easter Fillable Eggs", result.reply_message)
