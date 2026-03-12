@@ -6,7 +6,8 @@ Springfield Price Bot is an OpenClaw-compatible Telegram bot workspace for UK fo
 
 - Accepts plain-English UK food price questions and routes them to the strongest matching data source.
 - Uses the Kaggle-derived CSV snapshot first for item matching and retailer shortlisting.
-- Attempts live item-level retailer comparisons from reachable retailer search pages next for specialist products such as Wagyu beef.
+- Normalizes price-per-unit comparison where possible, so results can rank on `£/kg`, `£/l`, or `£/each` instead of only shelf price.
+- Attempts live item-level retailer comparisons from reachable retailer search pages or retailer JSON search endpoints next for specialist products such as Wagyu beef.
 - Uses PricesAPI after retailer search pages when credentials are configured and the live retailer-page path does not yield a usable match.
 - Keeps Bright Data Google Shopping as a later live-offer path when PricesAPI is unavailable or does not return usable matches.
 - Prioritizes official UK statistics when the user asks for government or official sources.
@@ -32,7 +33,7 @@ The bot treats these differently:
 - Community retailer datasets are best for supermarket-to-supermarket value checks and price-per-unit comparisons.
 - PricesAPI is useful for low-cost live offer checks, but its seller coverage is catalog-dependent and may not include every UK grocery retailer.
 - Bright Data Google Shopping is best for fresher live offer checks once the CSV shortlist identifies which retailers are worth probing.
-- For specialist live-product searches, the bot can also scrape reachable retailer search pages and return current product links.
+- For specialist live-product searches, the bot can also scrape reachable retailer search pages and retailer JSON search endpoints, then return current product links.
 - The Pi-compatible snapshot fallback reads a locally built CSV file, so the runtime does not need parquet readers or Kaggle credentials.
 - Geolytix helps find nearby stores, but it is not a price feed.
 - Nearby-store queries default to postcode `PA2 0SG` when the user does not supply a location.
@@ -84,6 +85,12 @@ Optional:
 - `SPRINGFIELD_PRICE_USER_AGENT`
 - `SPRINGFIELD_PRICE_FETCH_TIMEOUT_SEC`
 - `SPRINGFIELD_PRICE_DEFAULT_POSTCODE` location fallback for nearby-store queries, default `PA2 0SG`
+- `SPRINGFIELD_PRICE_CACHE_ENABLED` enable SQLite caching for recent live fetches, default `1`
+- `SPRINGFIELD_PRICE_CACHE_DB_PATH` optional SQLite cache path, default `data/search_cache.sqlite3`
+- `SPRINGFIELD_PRICE_CACHE_TTL_SEC` default cache freshness window in seconds, default `14400`
+- `SPRINGFIELD_PRICE_CACHE_HTML_TTL_SEC` optional HTML cache TTL override
+- `SPRINGFIELD_PRICE_CACHE_JSON_TTL_SEC` optional JSON page cache TTL override
+- `SPRINGFIELD_PRICE_CACHE_API_TTL_SEC` optional API cache TTL override for PricesAPI and Bright Data
 - `SPRINGFIELD_PRICE_PRICESAPI_KEY` PricesAPI key for live catalog/offers lookup
 - `SPRINGFIELD_PRICE_PRICESAPI_COUNTRY` optional, defaults to `uk`
 - `SPRINGFIELD_PRICE_BRIGHTDATA_API_KEY` Bright Data API token for live Google Shopping lookups
@@ -100,6 +107,36 @@ The direct item lookup order is:
 3. PricesAPI live offers for the top CSV retailers when configured
 4. Bright Data Google Shopping live offers for the top CSV retailers when configured
 5. CSV snapshot fallback
+
+Current live retailer-search sources:
+
+- Tom Hixson
+- Fine Food Specialist
+- Costco UK via `rest/v2/uk/products/search`, with a product-page price fallback when the JSON search result omits price
+
+Recent live searches are cached in SQLite so repeated item lookups do not refetch the same retailer pages and API responses over and over again. The cache sits under the fetch/API layer, so reply generation still reruns normally while recent HTML/JSON/API payloads are reused.
+
+Comparison-function implementation notes:
+
+- Keyword-first product matching, then per-retailer best-offer selection
+- Standardized unit-price comparison (`£/kg`, `£/l`, `£/each`) before falling back to shelf price
+- Own-brand tagging when the CSV source exposes it
+- Explicit caveats about freshness and data-source quality
+
+Reference material for the comparison design:
+
+- [Creating a Price Comparison Site for the UK's top 5 supermarkets with Python, Github and Streamlit](https://medium.com/@decmca21/creating-a-price-comparison-site-for-the-uks-top-5-supermarkets-with-python-github-and-streamlit-bd20b6f16ff2)
+- [Create a Price Comparison Site for the UK's top 5 supermarkets with Python, Github and Streamlit](https://medium.com/@decmca21/create-a-price-comparison-site-for-the-uks-top-5-supermarkets-with-python-github-and-streamlit-30ed8dca4eb4)
+- [RamonWill/price-comparison-project](https://github.com/RamonWill/price-comparison-project)
+- [RamonWill/price-comparison-project `SuperMarkIt/scripts/webscrapers.py`](https://github.com/RamonWill/price-comparison-project/blob/master/SuperMarkIt/scripts/webscrapers.py)
+
+SpringfieldPriceBot keeps the same comparison ideas from those articles, but uses a different runtime:
+
+- It keeps keyword-driven comparison and value-per-unit ranking.
+- It keeps own-brand and category signals from the CSV snapshot when available.
+- It does not reuse the Selenium scraping architecture directly; instead it mixes a local CSV snapshot with live retailer HTML/JSON fetches that fit the Pi deployment.
+- It prefers minimal direct fetches over a full browser stack so the Pi runtime stays lightweight.
+- It also borrows the `webscrapers.py` pattern of one shared fetch helper plus retailer-specific product-page extractors, used here as fallback selectors for Tesco, Sainsbury's, and Morrisons when generic JSON-LD/meta parsing misses the page price.
 
 ## Pipeline Usage
 
@@ -183,5 +220,6 @@ UK food price intelligence bot
 - Community retailer datasets are useful for operational price comparison, but they are not official statistics.
 - Bright Data live offer checks are fresher than the CSV snapshot, but they depend on Google Shopping and merchant-feed coverage.
 - PricesAPI live offer checks are also fresher than the CSV snapshot, but the API does not guarantee coverage for every UK supermarket in the shortlist.
-- Live retailer search-page matches can be fresher, but they depend on each retailer exposing parseable search HTML.
+- Live retailer search-page matches can be fresher, but they depend on each retailer exposing parseable search HTML or JSON.
+- Value ranking compares standardized unit price first when the item size is known, then falls back to shelf price.
 - Telegram users can send a public product URL when they need an exact live page-price extraction.

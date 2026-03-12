@@ -19,6 +19,11 @@ class SpringfieldPricePipelineTest(unittest.TestCase):
         self._pricesapi_key = module.os.environ.pop("SPRINGFIELD_PRICE_PRICESAPI_KEY", None)
         self._brightdata_api_key = module.os.environ.pop("SPRINGFIELD_PRICE_BRIGHTDATA_API_KEY", None)
         self._brightdata_zone = module.os.environ.pop("SPRINGFIELD_PRICE_BRIGHTDATA_SERP_ZONE", None)
+        self._cache_enabled = module.os.environ.get("SPRINGFIELD_PRICE_CACHE_ENABLED")
+        self._cache_db_path = module.os.environ.get("SPRINGFIELD_PRICE_CACHE_DB_PATH")
+        self._cache_dir = TemporaryDirectory()
+        module.os.environ["SPRINGFIELD_PRICE_CACHE_ENABLED"] = "1"
+        module.os.environ["SPRINGFIELD_PRICE_CACHE_DB_PATH"] = str(Path(self._cache_dir.name) / "search_cache.sqlite3")
 
     def tearDown(self):
         if self._pricesapi_key is None:
@@ -33,6 +38,15 @@ class SpringfieldPricePipelineTest(unittest.TestCase):
             module.os.environ.pop("SPRINGFIELD_PRICE_BRIGHTDATA_SERP_ZONE", None)
         else:
             module.os.environ["SPRINGFIELD_PRICE_BRIGHTDATA_SERP_ZONE"] = self._brightdata_zone
+        if self._cache_enabled is None:
+            module.os.environ.pop("SPRINGFIELD_PRICE_CACHE_ENABLED", None)
+        else:
+            module.os.environ["SPRINGFIELD_PRICE_CACHE_ENABLED"] = self._cache_enabled
+        if self._cache_db_path is None:
+            module.os.environ.pop("SPRINGFIELD_PRICE_CACHE_DB_PATH", None)
+        else:
+            module.os.environ["SPRINGFIELD_PRICE_CACHE_DB_PATH"] = self._cache_db_path
+        self._cache_dir.cleanup()
 
     def test_retailer_query_prefers_community_dataset(self):
         old_path = module.COMMUNITY_DATASET_CSV_PATH
@@ -59,6 +73,7 @@ class SpringfieldPricePipelineTest(unittest.TestCase):
                 "price_unit_gbp": 13.0,
                 "unit": "kg",
                 "capture_date": "2024-04-10T00:00:00",
+                "is_own_brand": True,
                 "score": 2,
             },
             {
@@ -79,8 +94,117 @@ class SpringfieldPricePipelineTest(unittest.TestCase):
         self.assertEqual(result.mode, "query")
         self.assertEqual(result.source, "Community UK supermarket time-series dataset")
         self.assertIn("Best retailer matches from community dataset", result.reply_message)
-        self.assertIn("Tesco Finest Wagyu Beef Burger - £6.50 (£13.00/kg)", result.reply_message)
+        self.assertIn("Comparison basis: standardized £/kg, then shelf price", result.reply_message)
+        self.assertIn("Tesco Finest Wagyu Beef Burger - £6.50 (£13.00/kg) - own brand", result.reply_message)
         self.assertIn("ASDA Wagyu Beef Burger - £7.00 (£14.00/kg)", result.reply_message)
+
+    def test_fetch_url_uses_sqlite_cache(self):
+        old_get = module.requests.get
+        calls = []
+
+        class FakeResponse:
+            def __init__(self):
+                self.text = "<html><title>Cached Product</title><meta property='product:price:amount' content='4.20'></html>"
+                self.url = "https://example.com/product"
+                self.headers = {"content-type": "text/html; charset=utf-8"}
+
+            def raise_for_status(self):
+                return None
+
+        def fake_get(url, headers=None, timeout=None):
+            calls.append(url)
+            return FakeResponse()
+
+        module.requests.get = fake_get
+        try:
+            first = module.fetch_url("https://example.com/product")
+            second = module.fetch_url("https://example.com/product")
+        finally:
+            module.requests.get = old_get
+        self.assertEqual(calls, ["https://example.com/product"])
+        self.assertEqual(first, second)
+        self.assertTrue(Path(module.os.environ["SPRINGFIELD_PRICE_CACHE_DB_PATH"]).exists())
+
+    def test_pricesapi_search_uses_sqlite_cache(self):
+        old_get = module.requests.get
+        calls = []
+        module.os.environ["SPRINGFIELD_PRICE_PRICESAPI_KEY"] = "pricesapi-test-key"
+
+        class FakeResponse:
+            def __init__(self):
+                self.headers = {"content-type": "application/json"}
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "data": {
+                        "results": [
+                            {"id": "wagyu-1", "title": "Wagyu Beef Burgers", "offerCount": 2},
+                        ]
+                    }
+                }
+
+        def fake_get(url, headers=None, params=None, timeout=None):
+            calls.append((url, tuple(sorted((params or {}).items()))))
+            return FakeResponse()
+
+        module.requests.get = fake_get
+        try:
+            first = module.fetch_pricesapi_search_results("wagyu beef")
+            second = module.fetch_pricesapi_search_results("wagyu beef")
+        finally:
+            module.requests.get = old_get
+        self.assertEqual(
+            calls,
+            [(f"{module.PRICESAPI_BASE_URL}/products/search", (("limit", module.PRICESAPI_SEARCH_LIMIT), ("q", "wagyu beef")))],
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(first[0]["id"], "wagyu-1")
+
+    def test_brightdata_lookup_uses_sqlite_cache(self):
+        old_post = module.requests.post
+        calls = []
+        module.os.environ["SPRINGFIELD_PRICE_BRIGHTDATA_API_KEY"] = "test-key"
+        module.os.environ["SPRINGFIELD_PRICE_BRIGHTDATA_SERP_ZONE"] = "test-zone"
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "shopping": [
+                        {
+                            "title": "Tesco Wagyu Burgers",
+                            "price": "£5.00",
+                            "shop": "Tesco",
+                            "link": "https://www.tesco.com/groceries/en-GB/products/123",
+                        }
+                    ]
+                }
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            calls.append((url, json["url"], json["zone"]))
+            return FakeResponse()
+
+        module.requests.post = fake_post
+        try:
+            first = module.fetch_brightdata_shopping_results("wagyu beef Tesco")
+            second = module.fetch_brightdata_shopping_results("wagyu beef Tesco")
+        finally:
+            module.requests.post = old_post
+        self.assertEqual(
+            calls,
+            [(
+                module.BRIGHTDATA_SERP_ENDPOINT,
+                module.build_brightdata_google_shopping_url("wagyu beef Tesco"),
+                "test-zone",
+            )],
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(first[0]["shop"], "Tesco")
 
     def test_pricesapi_lookup_uses_csv_shortlist_before_other_live_sources(self):
         with TemporaryDirectory() as tmpdir:
@@ -167,6 +291,7 @@ class SpringfieldPricePipelineTest(unittest.TestCase):
         </script>
         """
         old_fetch = module.fetch_url
+        old_fetch_json = module.fetch_json_url
         old_path = module.COMMUNITY_DATASET_CSV_PATH
         old_search = module.fetch_pricesapi_search_results
         old_offers = module.fetch_pricesapi_product_offers
@@ -181,19 +306,167 @@ class SpringfieldPricePipelineTest(unittest.TestCase):
             raise AssertionError(url)
 
         module.fetch_url = fake_fetch
+        module.fetch_json_url = lambda url: ({"products": []}, url)
         module.fetch_pricesapi_search_results = lambda query: (_ for _ in ()).throw(AssertionError(query))
         module.fetch_pricesapi_product_offers = lambda product_id: (_ for _ in ()).throw(AssertionError(product_id))
         try:
             result = module.analyze_payload("Where to buy UK wagyu beef with best price?")
         finally:
             module.fetch_url = old_fetch
+            module.fetch_json_url = old_fetch_json
             module.COMMUNITY_DATASET_CSV_PATH = old_path
             module.fetch_pricesapi_search_results = old_search
             module.fetch_pricesapi_product_offers = old_offers
         self.assertTrue(result.ok)
         self.assertEqual(result.source, "Retailer search pages")
         self.assertIn("Best matched live offers from retailer search pages", result.reply_message)
-        self.assertIn("Fine Food Specialist: Wagyu Beef Short Rib, BMS 4-5, Frozen - 650g - £18.95", result.reply_message)
+        self.assertIn("Comparison basis: standardized £/kg, then shelf price", result.reply_message)
+        self.assertIn("Fine Food Specialist: Wagyu Beef Short Rib, BMS 4-5, Frozen - 650g - £18.95 (£29.15/kg)", result.reply_message)
+
+    def test_costco_json_search_uses_product_page_price_fallback(self):
+        costco_url = "https://www.costco.co.uk/Grocery-Household/Chilled-Foods/Meat-Meat-Boxes/Taste-Tradition-Wagyu-Beef-Burgers-24-x-170g-6oz/p/305939"
+        costco_product_html = f"""
+        <html>
+          <head>
+            <meta property="product:price:amount" content="69.99">
+            <meta property="product:price:currency" content="GBP">
+          </head>
+          <body>
+            <div class="price-per-unit">£17.16/kg</div>
+            <script id="schemaorg_product" type="application/ld+json">
+            {{
+              "@context": "http://schema.org",
+              "@type": "Product",
+              "name": "Taste Tradition Wagyu Beef Burgers, 24 x 170g (6oz)",
+              "offers": {{
+                "@type": "Offer",
+                "price": "69.99",
+                "priceCurrency": "GBP",
+                "availability": "http://schema.org/OutOfStock",
+                "url": "{costco_url}"
+              }}
+            }}
+            </script>
+          </body>
+        </html>
+        """
+        old_fetch = module.fetch_url
+        old_fetch_json = module.fetch_json_url
+        old_path = module.COMMUNITY_DATASET_CSV_PATH
+        old_search = module.fetch_pricesapi_search_results
+        old_offers = module.fetch_pricesapi_product_offers
+        old_brightdata = module.fetch_brightdata_shopping_results
+        seen_urls = []
+        module.COMMUNITY_DATASET_CSV_PATH = ROOT / "tests" / "fixtures" / "missing-community.csv"
+
+        def fake_fetch_json(url: str):
+            seen_urls.append(url)
+            if "costco.co.uk/rest/v2/uk/products/search" not in url:
+                raise AssertionError(url)
+            return (
+                {
+                    "products": [
+                        {
+                            "name": "Taste Tradition Wagyu Beef Burgers, 24 x 170g (6oz)",
+                            "url": "/Grocery-Household/Chilled-Foods/Meat-Meat-Boxes/Taste-Tradition-Wagyu-Beef-Burgers-24-x-170g-6oz/p/305939",
+                        }
+                    ]
+                },
+                url,
+            )
+
+        def fake_fetch(url: str):
+            if "finefoodspecialist.co.uk" in url or "tomhixson.co.uk" in url:
+                return "", url
+            if url == costco_url:
+                return costco_product_html, url
+            raise AssertionError(url)
+
+        module.fetch_json_url = fake_fetch_json
+        module.fetch_url = fake_fetch
+        module.fetch_pricesapi_search_results = lambda query: (_ for _ in ()).throw(AssertionError(query))
+        module.fetch_pricesapi_product_offers = lambda product_id: (_ for _ in ()).throw(AssertionError(product_id))
+        module.fetch_brightdata_shopping_results = lambda query: (_ for _ in ()).throw(AssertionError(query))
+        try:
+            result = module.analyze_payload("Where to buy UK wagyu beef with best price?")
+        finally:
+            module.fetch_url = old_fetch
+            module.fetch_json_url = old_fetch_json
+            module.COMMUNITY_DATASET_CSV_PATH = old_path
+            module.fetch_pricesapi_search_results = old_search
+            module.fetch_pricesapi_product_offers = old_offers
+            module.fetch_brightdata_shopping_results = old_brightdata
+        self.assertTrue(result.ok)
+        self.assertEqual(result.source, "Retailer search pages")
+        self.assertEqual(
+            seen_urls,
+            ["https://www.costco.co.uk/rest/v2/uk/products/search?query=wagyu+beef&fields=FULL"],
+        )
+        self.assertIn("Best matched live offers from retailer search pages", result.reply_message)
+        self.assertIn("Comparison basis: standardized £/kg, then shelf price", result.reply_message)
+        self.assertIn("Costco: Taste Tradition Wagyu Beef Burgers, 24 x 170g (6oz) - £69.99 (£17.16/kg)", result.reply_message)
+        self.assertIn(f"Link: {costco_url}", result.reply_message)
+
+    def test_costco_requested_retailer_uses_live_search(self):
+        old_fetch = module.fetch_url
+        old_fetch_json = module.fetch_json_url
+        old_path = module.COMMUNITY_DATASET_CSV_PATH
+        old_search = module.fetch_pricesapi_search_results
+        old_offers = module.fetch_pricesapi_product_offers
+        old_brightdata = module.fetch_brightdata_shopping_results
+        seen_urls = []
+        module.COMMUNITY_DATASET_CSV_PATH = ROOT / "tests" / "fixtures" / "missing-community.csv"
+
+        def fake_fetch_json(url: str):
+            seen_urls.append(url)
+            return (
+                {
+                    "products": [
+                        {
+                            "name": "Taste Tradition Wagyu Beef Burgers, 24 x 170g (6oz)",
+                            "price": {"value": 69.99},
+                            "url": "/Grocery-Household/Chilled-Foods/Meat-Meat-Boxes/Taste-Tradition-Wagyu-Beef-Burgers-24-x-170g-6oz/p/305939",
+                        }
+                    ]
+                },
+                url,
+            )
+
+        module.fetch_json_url = fake_fetch_json
+        module.fetch_url = lambda url: (_ for _ in ()).throw(AssertionError(url))
+        module.fetch_pricesapi_search_results = lambda query: (_ for _ in ()).throw(AssertionError(query))
+        module.fetch_pricesapi_product_offers = lambda product_id: (_ for _ in ()).throw(AssertionError(product_id))
+        module.fetch_brightdata_shopping_results = lambda query: (_ for _ in ()).throw(AssertionError(query))
+        try:
+            result = module.analyze_payload("What is the Costco wagyu beef price?")
+        finally:
+            module.fetch_url = old_fetch
+            module.fetch_json_url = old_fetch_json
+            module.COMMUNITY_DATASET_CSV_PATH = old_path
+            module.fetch_pricesapi_search_results = old_search
+            module.fetch_pricesapi_product_offers = old_offers
+            module.fetch_brightdata_shopping_results = old_brightdata
+        self.assertTrue(result.ok)
+        self.assertEqual(result.source, "Retailer search pages")
+        self.assertEqual(
+            seen_urls,
+            ["https://www.costco.co.uk/rest/v2/uk/products/search?query=wagyu+beef&fields=FULL"],
+        )
+        self.assertIn("Retailers mentioned: Costco", result.reply_message)
+        self.assertIn("Comparison basis: standardized £/kg, then shelf price", result.reply_message)
+        self.assertIn("Costco: Taste Tradition Wagyu Beef Burgers, 24 x 170g (6oz) - £69.99 (£17.15/kg)", result.reply_message)
+
+    def test_live_offer_derives_each_price_from_pack_count(self):
+        offer = module.collect_live_offer(
+            "Costco",
+            "Shen Dan Boiled Salted Duck Eggs x 12",
+            5.49,
+            "https://www.costco.co.uk/Grocery-Household/Food-Cupboard/Shen-Dan-Boiled-Salted-Duck-Eggs-x-12/p/8523735",
+            ["shen", "dan", "duck"],
+        )
+        self.assertIsNotNone(offer)
+        self.assertEqual(offer["unit"], "each")
+        self.assertAlmostEqual(offer["price_unit_gbp"], 0.46, places=2)
 
     def test_brightdata_lookup_uses_csv_shortlist_before_live_shopping(self):
         with TemporaryDirectory() as tmpdir:
@@ -355,6 +628,32 @@ class SpringfieldPricePipelineTest(unittest.TestCase):
         self.assertIn("ASDA Eggs - £2.40 (£4.80/dozen)", result.reply_message)
         self.assertNotIn("Morrisons Eggs", result.reply_message)
 
+    def test_box_of_12_eggs_prefers_real_egg_packs(self):
+        with TemporaryDirectory() as tmpdir:
+            csv_path = Path(tmpdir) / "community_supermarket_latest.csv"
+            csv_path.write_text(
+                "supermarket_name,price_gbp,price_unit_gbp,unit,product_name,normalized_product_name,capture_date,category_name,is_own_brand\n"
+                "ASDA,2.4,4.8,dozen,ASDA Eggs,asda eggs,2024-04-11T00:00:00,fresh_food,true\n"
+                "Tesco,3.5,7.0,kg,Cadbury Creme Eggs 48 x 40g,cadbury creme eggs 48 x 40g,2024-04-10T00:00:00,food_cupboard,false\n"
+                "Sains,5.0,5.0,unit,A Dozen Red Roses,a dozen red roses,2024-04-09T00:00:00,fresh_food,false\n",
+                encoding="utf-8",
+            )
+            old_path = module.COMMUNITY_DATASET_CSV_PATH
+            old_fetch = module.fetch_url
+            module.COMMUNITY_DATASET_CSV_PATH = csv_path
+            module.fetch_url = lambda url: (_ for _ in ()).throw(RuntimeError("offline"))
+            try:
+                result = module.analyze_payload("I want to buy a box of 12 eggs")
+            finally:
+                module.COMMUNITY_DATASET_CSV_PATH = old_path
+                module.fetch_url = old_fetch
+        self.assertTrue(result.ok)
+        self.assertEqual(result.source, "Community UK supermarket time-series dataset")
+        self.assertIn("Search terms: eggs", result.reply_message)
+        self.assertIn("ASDA Eggs - £2.40 (£4.80/dozen)", result.reply_message)
+        self.assertNotIn("Cadbury Creme Eggs", result.reply_message)
+        self.assertNotIn("A Dozen Red Roses", result.reply_message)
+
     def test_csv_snapshot_skips_non_food_categories(self):
         with TemporaryDirectory() as tmpdir:
             csv_path = Path(tmpdir) / "community_supermarket_latest.csv"
@@ -412,6 +711,74 @@ class SpringfieldPricePipelineTest(unittest.TestCase):
         self.assertEqual(result.regular_high_price, 775.0)
         self.assertEqual(result.availability, "InStock")
         self.assertIn("Current price: £274.00 to £494.00", result.reply_message)
+
+    def test_sainsburys_product_page_fallback_uses_price_per_unit_selector(self):
+        url = "https://www.sainsburys.co.uk/gol-ui/product/sainsburys-free-range-eggs"
+        html = """
+        <html>
+          <head><title>Sainsbury's British Free Range Eggs</title></head>
+          <body>
+            <p class="pricePerUnit">50p/each</p>
+          </body>
+        </html>
+        """
+        old_fetch = module.fetch_url
+        module.fetch_url = lambda incoming_url: (html, incoming_url)
+        try:
+            result = module.analyze_payload(url)
+        finally:
+            module.fetch_url = old_fetch
+        self.assertTrue(result.ok)
+        self.assertEqual(result.mode, "product")
+        self.assertEqual(result.currency, "GBP")
+        self.assertEqual(result.current_price, 0.5)
+        self.assertIn("Current price: £0.50", result.reply_message)
+
+    def test_morrisons_product_page_fallback_uses_nowprice_or_typicalprice(self):
+        url = "https://groceries.morrisons.com/products/morrisons-milk"
+        html = """
+        <html>
+          <head><title>Morrisons Semi Skimmed Milk</title></head>
+          <body>
+            <div class="related-search-ribbon-enabled">
+              <span class="typicalPrice">£1.70</span>
+            </div>
+          </body>
+        </html>
+        """
+        old_fetch = module.fetch_url
+        module.fetch_url = lambda incoming_url: (html, incoming_url)
+        try:
+            result = module.analyze_payload(url)
+        finally:
+            module.fetch_url = old_fetch
+        self.assertTrue(result.ok)
+        self.assertEqual(result.mode, "product")
+        self.assertEqual(result.currency, "GBP")
+        self.assertEqual(result.current_price, 1.7)
+        self.assertIn("Current price: £1.70", result.reply_message)
+
+    def test_tesco_product_page_fallback_uses_value_selector(self):
+        url = "https://www.tesco.com/groceries/en-GB/products/123456789"
+        html = """
+        <html>
+          <head><title>Tesco Pasta</title></head>
+          <body>
+            <span class="value">2.50</span>
+          </body>
+        </html>
+        """
+        old_fetch = module.fetch_url
+        module.fetch_url = lambda incoming_url: (html, incoming_url)
+        try:
+            result = module.analyze_payload(url)
+        finally:
+            module.fetch_url = old_fetch
+        self.assertTrue(result.ok)
+        self.assertEqual(result.mode, "product")
+        self.assertEqual(result.currency, "GBP")
+        self.assertEqual(result.current_price, 2.5)
+        self.assertIn("Current price: £2.50", result.reply_message)
 
     def test_error_for_empty_payload(self):
         result = module.analyze_payload("")

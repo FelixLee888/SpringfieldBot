@@ -5,13 +5,16 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import html
 import ipaddress
 import json
 import math
 import os
 import re
+import sqlite3
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -36,6 +39,8 @@ DEFAULT_USER_AGENT = os.getenv(
 )
 DEFAULT_TIMEOUT = float(os.getenv("SPRINGFIELD_PRICE_FETCH_TIMEOUT_SEC", "20"))
 DEFAULT_LOCATION_POSTCODE = os.getenv("SPRINGFIELD_PRICE_DEFAULT_POSTCODE", "PA2 0SG").strip() or "PA2 0SG"
+CACHE_DB_DEFAULT_PATH = Path(__file__).resolve().parent.parent / "data" / "search_cache.sqlite3"
+CACHE_DEFAULT_TTL_SEC = int(os.getenv("SPRINGFIELD_PRICE_CACHE_TTL_SEC", "14400"))
 URL_RE = re.compile(r"https?://[^\s<>'\"]+")
 WORD_RE = re.compile(r"[a-z0-9']+")
 UK_POSTCODE_RE = re.compile(r"\b([A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})\b", re.IGNORECASE)
@@ -57,10 +62,29 @@ META_CURRENCY_RE = re.compile(
 )
 TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 TAG_RE = re.compile(r"<[^>]+>")
+CLASS_BLOCK_RE_TEMPLATE = r"<(?P<tag>[a-z0-9]+)[^>]+class=[\"'][^\"']*\b{class_name}\b[^\"']*[\"'][^>]*>(?P<body>.*?)</(?P=tag)>"
 WHITESPACE_RE = re.compile(r"\s+")
 AMOUNT_RE = re.compile(r"(?:£|\$|€)\s*([0-9]+(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)")
+PRICE_PER_STANDARD_UNIT_RE = re.compile(
+    r"(?:£|\$|€)\s*([0-9]+(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)\s*(?:/|per\s*)(?:(\d+(?:\.\d+)?)\s*)?(kg|g|oz|lb|l|litre|liter|ml|cl|each|ea|unit)\b",
+    re.IGNORECASE,
+)
+MULTIPACK_MEASURE_RE = re.compile(
+    r"\b(\d+)\s*[xX]\s*(\d+(?:\.\d+)?)\s*(kg|g|oz|lb|l|litre|liter|ml|cl)\b",
+    re.IGNORECASE,
+)
+SINGLE_MEASURE_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*(kg|g|oz|lb|l|litre|liter|ml|cl)\b", re.IGNORECASE)
+COUNT_PACK_RE = re.compile(r"\b(?:pack\s+of\s+)?(\d+)\s*(?:pack|packs|pk|pcs?|pieces?|eggs?|bottles?|cans?)\b", re.IGNORECASE)
+COUNT_TAIL_RE = re.compile(r"\bx\s*(\d+)\s*$", re.IGNORECASE)
 TEXT_AVAILABILITY_RE = re.compile(r"\b(in stock|out of stock|available|unavailable)\b", re.IGNORECASE)
 LOCAL_FILE_FALSE_VALUES = {"0", "false", "no", "off"}
+_CACHE_DISABLED_VALUES = {"0", "false", "no", "off"}
+_CACHE_NAMESPACE_TTLS = {
+    "html_url": "SPRINGFIELD_PRICE_CACHE_HTML_TTL_SEC",
+    "json_url": "SPRINGFIELD_PRICE_CACHE_JSON_TTL_SEC",
+    "pricesapi_json": "SPRINGFIELD_PRICE_CACHE_API_TTL_SEC",
+    "brightdata_shopping": "SPRINGFIELD_PRICE_CACHE_API_TTL_SEC",
+}
 
 QUERY_LABELS = {
     "retailer_comparison": "Retailer comparison",
@@ -75,6 +99,7 @@ RETAILER_ALIASES = {
     "asda": "ASDA",
     "coop": "Co-op",
     "co-op": "Co-op",
+    "costco": "Costco",
     "iceland": "Iceland",
     "lidl": "Lidl",
     "morrisons": "Morrisons",
@@ -90,6 +115,8 @@ LOCATION_KEYWORDS = {"near", "nearby", "postcode", "location", "locations", "sto
 VALUE_KEYWORDS = {"best", "value", "cheapest", "cheap", "lowest", "compare", "comparison", "versus", "vs", "unit", "price", "prices", "per", "deal"}
 LIVE_PRICE_KEYWORDS = {"today", "current", "currently", "live", "now", "this", "week"}
 OFFICIAL_ONLY_KEYWORDS = {"official", "government", "ons", "gov", "govuk", "defra"}
+PACKAGE_QUERY_TERMS = {"bag", "bags", "bottle", "bottles", "box", "boxes", "carton", "cartons", "case", "cases", "pack", "packs", "packet", "packets", "tray", "trays"}
+EGG_QUERY_EXCLUDED_TERMS = {"cadbury", "chocolate", "creme", "easter", "mini", "scotch", "savoury", "surprise"}
 QUERY_NOISE = {
     "a",
     "an",
@@ -142,7 +169,11 @@ QUERY_NOISE = {
     "value",
     "week",
     "where",
+    "what",
+    "which",
     "with",
+    *PACKAGE_QUERY_TERMS,
+    "dozen",
 }
 
 
@@ -287,6 +318,7 @@ CANONICAL_RETAILER_NAMES = {
     "coop": "Co-op",
     "cooperative": "Co-op",
     "co-op": "Co-op",
+    "costco": "Costco",
     "groceriesasda": "ASDA",
     "groceriesmorrisons": "Morrisons",
     "iceland": "Iceland",
@@ -300,6 +332,7 @@ CANONICAL_RETAILER_NAMES = {
 }
 RETAILER_HOST_NAMES = {
     "aldi.co.uk": "Aldi",
+    "costco.co.uk": "Costco",
     "groceries.asda.com": "ASDA",
     "morrisons.com": "Morrisons",
     "groceries.morrisons.com": "Morrisons",
@@ -320,12 +353,22 @@ MERCHANT_SEARCH_SOURCES = (
         "product_base_url": "https://www.finefoodspecialist.co.uk/products/",
         "parser": "shopify_meta",
     },
+    {
+        "name": "Costco",
+        "retailer": "Costco",
+        "search_url": "https://www.costco.co.uk/rest/v2/uk/products/search?query={query}&fields=FULL",
+        "product_base_url": "https://www.costco.co.uk/",
+        "parser": "costco_rest_json",
+        "response_type": "json",
+        "min_search_terms": 2,
+    },
 )
 WLFDN_PRODUCT_PUSH_RE = re.compile(r'_WLFDN\.shopify\.product_data\.push\((\{.*?\})\);', re.DOTALL)
 WLFDN_HANDLE_RE = re.compile(r'"handle"\s*:\s*"([^"]+)"')
 WLFDN_NAME_RE = re.compile(r'"item_name"\s*:\s*"([^"]+)"')
 WLFDN_PRICE_RE = re.compile(r'"price"\s*:\s*"([^"]+)"')
 MERCHANT_EXCLUDED_TERMS = {"box", "bundle", "dripping", "fat", "gin", "hamper", "pie", "sauce", "seasoning"}
+MERCHANT_PRODUCT_PAGE_FETCH_LIMIT = max(1, int(os.getenv("SPRINGFIELD_PRICE_MERCHANT_PAGE_FETCH_LIMIT", "4")))
 
 
 def read_stdin() -> str:
@@ -335,6 +378,141 @@ def read_stdin() -> str:
 def local_files_allowed() -> bool:
     raw = os.getenv("SPRINGFIELD_PRICE_ALLOW_LOCAL_FILES", "1").strip().lower()
     return raw not in LOCAL_FILE_FALSE_VALUES
+
+
+def cache_enabled() -> bool:
+    raw = os.getenv("SPRINGFIELD_PRICE_CACHE_ENABLED", "1").strip().lower()
+    return raw not in _CACHE_DISABLED_VALUES
+
+
+def cache_db_path() -> Path:
+    raw = os.getenv("SPRINGFIELD_PRICE_CACHE_DB_PATH", "").strip()
+    if not raw:
+        return CACHE_DB_DEFAULT_PATH
+    return Path(raw).expanduser()
+
+
+def cache_ttl_seconds(namespace: str) -> int:
+    env_key = _CACHE_NAMESPACE_TTLS.get(namespace, "SPRINGFIELD_PRICE_CACHE_TTL_SEC")
+    raw = os.getenv(env_key, "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            return CACHE_DEFAULT_TTL_SEC
+    return CACHE_DEFAULT_TTL_SEC
+
+
+def stable_cache_key(namespace: str, payload: Dict[str, Any]) -> Tuple[str, str]:
+    fingerprint = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    digest = hashlib.sha256(f"{namespace}:{fingerprint}".encode("utf-8")).hexdigest()
+    return digest, fingerprint
+
+
+def open_cache_db() -> sqlite3.Connection:
+    path = cache_db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path, timeout=30)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS request_cache (
+            namespace TEXT NOT NULL,
+            cache_key TEXT NOT NULL,
+            request_fingerprint TEXT NOT NULL,
+            response_url TEXT NOT NULL DEFAULT '',
+            body_text TEXT NOT NULL,
+            fetched_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            last_accessed_at INTEGER NOT NULL,
+            hit_count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (namespace, cache_key)
+        )
+        """
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_request_cache_expires_at ON request_cache (expires_at)")
+    return connection
+
+
+def cache_get(namespace: str, payload: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+    if not cache_enabled():
+        return None
+    cache_key, _ = stable_cache_key(namespace, payload)
+    now = int(time.time())
+    connection = open_cache_db()
+    try:
+        connection.execute("DELETE FROM request_cache WHERE expires_at <= ?", (now,))
+        row = connection.execute(
+            """
+            SELECT body_text, response_url
+            FROM request_cache
+            WHERE namespace = ? AND cache_key = ? AND expires_at > ?
+            """,
+            (namespace, cache_key, now),
+        ).fetchone()
+        if row is None:
+            connection.commit()
+            return None
+        connection.execute(
+            """
+            UPDATE request_cache
+            SET last_accessed_at = ?, hit_count = hit_count + 1
+            WHERE namespace = ? AND cache_key = ?
+            """,
+            (now, namespace, cache_key),
+        )
+        connection.commit()
+        return str(row["body_text"]), str(row["response_url"])
+    finally:
+        connection.close()
+
+
+def cache_put(namespace: str, payload: Dict[str, Any], body_text: str, response_url: str, *, ttl_seconds: Optional[int] = None) -> None:
+    if not cache_enabled():
+        return
+    effective_ttl = cache_ttl_seconds(namespace) if ttl_seconds is None else max(0, int(ttl_seconds))
+    if effective_ttl <= 0:
+        return
+    cache_key, fingerprint = stable_cache_key(namespace, payload)
+    now = int(time.time())
+    connection = open_cache_db()
+    try:
+        connection.execute(
+            """
+            INSERT INTO request_cache (
+                namespace,
+                cache_key,
+                request_fingerprint,
+                response_url,
+                body_text,
+                fetched_at,
+                expires_at,
+                last_accessed_at,
+                hit_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+            ON CONFLICT(namespace, cache_key) DO UPDATE SET
+                request_fingerprint = excluded.request_fingerprint,
+                response_url = excluded.response_url,
+                body_text = excluded.body_text,
+                fetched_at = excluded.fetched_at,
+                expires_at = excluded.expires_at,
+                last_accessed_at = excluded.last_accessed_at
+            """,
+            (
+                namespace,
+                cache_key,
+                fingerprint,
+                response_url,
+                body_text,
+                now,
+                now + effective_ttl,
+                now,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
 
 
 def first_existing_path(text: str) -> Optional[Path]:
@@ -399,6 +577,11 @@ def ensure_public_url(url: str) -> None:
 
 def fetch_url(url: str) -> Tuple[str, str]:
     ensure_public_url(url)
+    cache_payload = {"url": url}
+    cached = cache_get("html_url", cache_payload)
+    if cached is not None:
+        body_text, response_url = cached
+        return body_text, response_url or url
     response = requests.get(
         url,
         headers={
@@ -411,7 +594,32 @@ def fetch_url(url: str) -> Tuple[str, str]:
     content_type = response.headers.get("content-type", "")
     if "html" not in content_type.lower() and "xml" not in content_type.lower():
         raise RuntimeError(f"expected HTML but got content-type {content_type or 'unknown'}")
+    cache_put("html_url", cache_payload, response.text, response.url)
     return response.text, response.url
+
+
+def fetch_json_url(url: str) -> Tuple[Any, str]:
+    ensure_public_url(url)
+    cache_payload = {"url": url}
+    cached = cache_get("json_url", cache_payload)
+    if cached is not None:
+        body_text, response_url = cached
+        try:
+            return json.loads(body_text), response_url or url
+        except ValueError:
+            pass
+    response = requests.get(
+        url,
+        headers={
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Accept": "application/json,text/plain;q=0.9,*/*;q=0.8",
+        },
+        timeout=DEFAULT_TIMEOUT,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    cache_put("json_url", cache_payload, json.dumps(payload, sort_keys=True), response.url)
+    return payload, response.url
 
 
 def resolve_source(raw_text: str) -> SourcePayload:
@@ -448,6 +656,14 @@ def resolve_source(raw_text: str) -> SourcePayload:
 
 def strip_tags(text: str) -> str:
     return WHITESPACE_RE.sub(" ", html.unescape(TAG_RE.sub(" ", text or ""))).strip()
+
+
+def first_class_block_text(html_text: str, class_name: str) -> str:
+    pattern = re.compile(CLASS_BLOCK_RE_TEMPLATE.format(class_name=re.escape(class_name)), re.IGNORECASE | re.DOTALL)
+    match = pattern.search(html_text or "")
+    if not match:
+        return ""
+    return strip_tags(match.group("body"))
 
 
 def normalize_currency(value: str) -> str:
@@ -503,6 +719,147 @@ def format_range(currency: str, low: Optional[float], high: Optional[float]) -> 
     if high is None or abs(low - high) < 1e-9:
         return format_amount(currency, low)
     return f"{format_amount(currency, low)} to {format_amount(currency, high)}"
+
+
+def normalize_measure_unit(amount: float, unit: str) -> Tuple[Optional[float], str]:
+    unit_key = normalize_text(unit).replace(" ", "")
+    if unit_key == "kg":
+        return amount, "kg"
+    if unit_key == "g":
+        return amount / 1000.0, "kg"
+    if unit_key == "oz":
+        return amount * 0.028349523125, "kg"
+    if unit_key == "lb":
+        return amount * 0.45359237, "kg"
+    if unit_key in {"l", "litre", "liter"}:
+        return amount, "l"
+    if unit_key == "ml":
+        return amount / 1000.0, "l"
+    if unit_key == "cl":
+        return amount / 100.0, "l"
+    if unit_key in {"each", "ea", "unit"}:
+        return amount, "each"
+    return None, ""
+
+
+def infer_standard_quantity(product_name: str) -> Tuple[Optional[float], str]:
+    text = (product_name or "").strip()
+    if not text:
+        return None, ""
+    for match in MULTIPACK_MEASURE_RE.finditer(text):
+        count = parse_amount(match.group(1))
+        amount = parse_amount(match.group(2))
+        if count is None or amount is None:
+            continue
+        normalized_amount, normalized_unit = normalize_measure_unit(float(count) * float(amount), match.group(3))
+        if normalized_amount is not None and normalized_amount > 0:
+            return normalized_amount, normalized_unit
+    last_single: Tuple[Optional[float], str] = (None, "")
+    for match in SINGLE_MEASURE_RE.finditer(text):
+        amount = parse_amount(match.group(1))
+        if amount is None:
+            continue
+        normalized_amount, normalized_unit = normalize_measure_unit(amount, match.group(2))
+        if normalized_amount is not None and normalized_amount > 0:
+            last_single = (normalized_amount, normalized_unit)
+    if last_single[0] is not None:
+        return last_single
+    count_match = COUNT_PACK_RE.search(text)
+    if count_match:
+        count = parse_amount(count_match.group(1))
+        if count is not None and count > 0:
+            return count, "each"
+    tail_match = COUNT_TAIL_RE.search(text)
+    if tail_match:
+        count = parse_amount(tail_match.group(1))
+        if count is not None and count > 0:
+            return count, "each"
+    return None, ""
+
+
+def extract_requested_pack_count(text: str) -> Optional[int]:
+    lowered = (text or "").lower()
+    if not lowered:
+        return None
+    if re.search(r"\bdozen\b", lowered):
+        return 12
+    patterns = (
+        r"\b(?:box|boxes|pack|packs|carton|cartons|tray|trays|case|cases)\s+of\s+(\d+)\b",
+        r"\b(\d+)\s*(?:eggs?|pack|packs|box|boxes|carton|cartons|tray|trays|case|cases|pcs?|pieces?)\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, lowered)
+        if not match:
+            continue
+        count = parse_amount(match.group(1))
+        if count is not None and count > 0:
+            return int(count)
+    return None
+
+
+def infer_offer_pack_count(product_name: str, unit: str = "") -> Optional[int]:
+    lowered_name = (product_name or "").lower()
+    lowered_unit = (unit or "").lower()
+    if lowered_unit == "dozen":
+        return 12
+    multipack_match = MULTIPACK_MEASURE_RE.search(lowered_name)
+    if multipack_match:
+        count = parse_amount(multipack_match.group(1))
+        if count is not None and count > 0:
+            return int(count)
+    dozen_match = re.search(r"\b(\d+)?\s*dozen\b", lowered_name)
+    if dozen_match:
+        count = parse_amount(dozen_match.group(1) or "1")
+        if count is not None and count > 0:
+            return int(count * 12)
+    count_match = COUNT_PACK_RE.search(lowered_name)
+    if count_match:
+        count = parse_amount(count_match.group(1))
+        if count is not None and count > 0:
+            return int(count)
+    tail_match = COUNT_TAIL_RE.search(lowered_name)
+    if tail_match:
+        count = parse_amount(tail_match.group(1))
+        if count is not None and count > 0:
+            return int(count)
+    return None
+
+
+def pack_count_adjustment(requested_count: Optional[int], offered_count: Optional[int]) -> int:
+    if requested_count is None or requested_count <= 0 or offered_count is None or offered_count <= 0:
+        return 0
+    if offered_count == requested_count:
+        return 3
+    difference = abs(offered_count - requested_count)
+    if difference <= 1:
+        return 2
+    if difference <= 3:
+        return 1
+    if offered_count % requested_count == 0 and offered_count <= requested_count * 2:
+        return 1
+    return -3
+
+
+def derive_standard_unit_price(price_gbp: Optional[float], product_name: str) -> Tuple[Optional[float], str]:
+    if price_gbp is None:
+        return None, ""
+    quantity, unit = infer_standard_quantity(product_name)
+    if quantity is None or quantity <= 0 or not unit:
+        return None, ""
+    return round(float(price_gbp) / quantity, 2), unit
+
+
+def extract_standard_unit_price_from_text(text: str) -> Tuple[Optional[float], str]:
+    for match in PRICE_PER_STANDARD_UNIT_RE.finditer(text or ""):
+        amount = parse_amount(match.group(1))
+        denominator = parse_amount(match.group(2) or "1")
+        if amount is None or denominator is None or denominator <= 0:
+            continue
+        normalized_quantity, normalized_unit = normalize_measure_unit(denominator, match.group(3))
+        if normalized_quantity is None or normalized_quantity <= 0 or not normalized_unit:
+            continue
+        return round(amount / normalized_quantity, 2), normalized_unit
+    return None, ""
 
 
 def walk_nodes(value: Any) -> Iterable[Dict[str, Any]]:
@@ -660,6 +1017,60 @@ def extract_from_meta(html_text: str) -> Dict[str, Any]:
     if currency_match:
         result["currency"] = normalize_currency(currency_match.group(1))
     return result
+
+
+def parse_retail_price_text(text: str) -> Optional[float]:
+    cleaned = strip_tags(text)
+    if not cleaned:
+        return None
+    leading = cleaned.split("/", 1)[0].strip()
+    if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?\s*p", leading, re.IGNORECASE):
+        amount = parse_amount(leading)
+        return None if amount is None else round(amount / 100.0, 2)
+    return parse_amount(leading)
+
+
+def extract_sainsburys_html_price(html_text: str) -> Dict[str, Any]:
+    block_text = first_class_block_text(html_text, "pricePerUnit")
+    if not block_text:
+        return {}
+    result: Dict[str, Any] = {"currency": "GBP"}
+    current_price = parse_retail_price_text(block_text)
+    if current_price is not None:
+        result["current_price"] = current_price
+    unit_price, unit = extract_standard_unit_price_from_text(block_text)
+    if unit_price is not None and unit:
+        result["price_unit_gbp"] = unit_price
+        result["unit"] = unit
+    return result
+
+
+def extract_morrisons_html_price(html_text: str) -> Dict[str, Any]:
+    for class_name in ("nowPrice", "typicalPrice"):
+        block_text = first_class_block_text(html_text, class_name)
+        current_price = parse_retail_price_text(block_text)
+        if current_price is not None:
+            return {"current_price": current_price, "currency": "GBP"}
+    return {}
+
+
+def extract_tesco_html_price(html_text: str) -> Dict[str, Any]:
+    block_text = first_class_block_text(html_text, "value")
+    current_price = parse_retail_price_text(block_text)
+    if current_price is None:
+        return {}
+    return {"current_price": current_price, "currency": "GBP"}
+
+
+def extract_from_known_retailer_html(html_text: str, url: str) -> Dict[str, Any]:
+    retailer = retailer_name_from_url(url)
+    if retailer == "Sainsbury's":
+        return extract_sainsburys_html_price(html_text)
+    if retailer == "Morrisons":
+        return extract_morrisons_html_price(html_text)
+    if retailer == "Tesco":
+        return extract_tesco_html_price(html_text)
+    return {}
 
 
 def extract_from_title(html_text: str) -> Dict[str, Any]:
@@ -881,6 +1292,8 @@ def should_try_direct_item_lookup(plan: Dict[str, Any]) -> bool:
         return True
     if len(terms) >= 2:
         return True
+    if plan.get("requested_pack_count") is not None:
+        return True
     return terms[0] not in BROAD_ITEM_TERMS
 
 
@@ -901,7 +1314,14 @@ def retailer_requested(plan: Dict[str, Any], retailer_name: str) -> bool:
     return normalize_retailer_key(retailer_name) in requested
 
 
-def matching_term_score(normalized_name: str, search_terms: List[str]) -> int:
+def matching_term_score(
+    normalized_name: str,
+    search_terms: List[str],
+    *,
+    product_name: str = "",
+    requested_pack_count: Optional[int] = None,
+    unit: str = "",
+) -> int:
     if not normalized_name:
         return 0
     primary_term = search_terms[0]
@@ -911,6 +1331,10 @@ def matching_term_score(normalized_name: str, search_terms: List[str]) -> int:
     phrase = " ".join(search_terms)
     if len(search_terms) > 1 and phrase and phrase in normalized_name:
         score += 1
+    if len(search_terms) == 1 and search_terms[0] == "eggs":
+        if any(term in normalized_name for term in EGG_QUERY_EXCLUDED_TERMS):
+            return 0
+    score += pack_count_adjustment(requested_pack_count, infer_offer_pack_count(product_name or normalized_name, unit))
     return score
 
 
@@ -928,13 +1352,20 @@ def better_retailer_offer(existing: Optional[Dict[str, Any]], candidate: Dict[st
     return candidate if capture_rank(candidate.get("capture_date", "")) > capture_rank(existing.get("capture_date", "")) else existing
 
 
-def collect_offer_candidate(row: Dict[str, Any], search_terms: List[str]) -> Optional[Dict[str, Any]]:
+def collect_offer_candidate(row: Dict[str, Any], search_terms: List[str], requested_pack_count: Optional[int] = None) -> Optional[Dict[str, Any]]:
     product_name = str(row.get("product_name") or "").strip()
     normalized_name = str(row.get("normalized_product_name") or normalize_text(product_name)).strip()
     category_name = str(row.get("category_name") or "").strip().lower()
     if category_name and category_name not in FOOD_CATEGORY_ALLOWLIST:
         return None
-    score = matching_term_score(normalized_name, search_terms)
+    unit = str(row.get("unit") or "").strip()
+    score = matching_term_score(
+        normalized_name,
+        search_terms,
+        product_name=product_name,
+        requested_pack_count=requested_pack_count,
+        unit=unit,
+    )
     if score <= 0:
         return None
     price_gbp = parse_amount(row.get("price_gbp"))
@@ -946,7 +1377,7 @@ def collect_offer_candidate(row: Dict[str, Any], search_terms: List[str]) -> Opt
         "product_name": product_name,
         "price_gbp": price_gbp,
         "price_unit_gbp": price_unit_gbp,
-        "unit": str(row.get("unit") or "").strip(),
+        "unit": unit,
         "capture_date": str(row.get("capture_date") or "").strip(),
         "category_name": category_name,
         "is_own_brand": str(row.get("is_own_brand") or "").strip().lower() in {"1", "true", "yes"},
@@ -992,6 +1423,15 @@ def pricesapi_enabled() -> bool:
 
 
 def fetch_pricesapi_json(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    cache_payload = {"base_url": PRICESAPI_BASE_URL, "path": path, "params": params}
+    cached = cache_get("pricesapi_json", cache_payload)
+    if cached is not None:
+        body_text, _ = cached
+        try:
+            payload = json.loads(body_text)
+        except ValueError:
+            payload = {}
+        return payload if isinstance(payload, dict) else {}
     response = requests.get(
         f"{PRICESAPI_BASE_URL}{path}",
         headers={
@@ -1003,6 +1443,7 @@ def fetch_pricesapi_json(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
     )
     response.raise_for_status()
     payload = response.json()
+    cache_put("pricesapi_json", cache_payload, json.dumps(payload, sort_keys=True), f"{PRICESAPI_BASE_URL}{path}")
     if not isinstance(payload, dict):
         return {}
     return payload
@@ -1040,11 +1481,16 @@ def fetch_pricesapi_product_offers(product_id: Any) -> List[Dict[str, Any]]:
     return [item for item in offers if isinstance(item, dict)]
 
 
-def score_pricesapi_product(result: Dict[str, Any], search_terms: List[str]) -> int:
+def score_pricesapi_product(result: Dict[str, Any], search_terms: List[str], requested_pack_count: Optional[int] = None) -> int:
     title = str(result.get("title") or "").strip()
     if not title:
         return 0
-    score = matching_term_score(normalize_text(title), search_terms)
+    score = matching_term_score(
+        normalize_text(title),
+        search_terms,
+        product_name=title,
+        requested_pack_count=requested_pack_count,
+    )
     offer_count = int(parse_amount(result.get("offerCount")) or 0)
     if offer_count > 0:
         score += 1
@@ -1060,12 +1506,21 @@ def fetch_brightdata_shopping_results(query: str) -> List[Dict[str, Any]]:
     if not brightdata_enabled():
         return []
     payload = {
+        "endpoint": BRIGHTDATA_SERP_ENDPOINT,
         "zone": brightdata_zone(),
         "url": build_brightdata_google_shopping_url(query),
         "format": "json",
         "method": "GET",
         "country": BRIGHTDATA_SERP_COUNTRY,
     }
+    cached = cache_get("brightdata_shopping", payload)
+    if cached is not None:
+        body_text, _ = cached
+        try:
+            raw = json.loads(body_text)
+        except ValueError:
+            return []
+        return extract_brightdata_shopping_results(raw)
     response = requests.post(
         BRIGHTDATA_SERP_ENDPOINT,
         headers={
@@ -1081,6 +1536,7 @@ def fetch_brightdata_shopping_results(query: str) -> List[Dict[str, Any]]:
         raw = response.json()
     except ValueError:
         return []
+    cache_put("brightdata_shopping", payload, json.dumps(raw, sort_keys=True), BRIGHTDATA_SERP_ENDPOINT)
     return extract_brightdata_shopping_results(raw)
 
 
@@ -1131,6 +1587,7 @@ def collect_pricesapi_offer(
     offer: Dict[str, Any],
     search_terms: List[str],
     shortlist_keys: set[str],
+    requested_pack_count: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     product_name = str(offer.get("productTitle") or offer.get("title") or "").strip()
     if not product_name:
@@ -1144,7 +1601,12 @@ def collect_pricesapi_offer(
     currency = normalize_currency(str(offer.get("currency") or ""))
     if price_gbp is None or (currency and currency != "GBP"):
         return None
-    score = matching_term_score(normalize_text(product_name), search_terms)
+    score = matching_term_score(
+        normalize_text(product_name),
+        search_terms,
+        product_name=product_name,
+        requested_pack_count=requested_pack_count,
+    )
     if score <= 0:
         return None
     return {
@@ -1178,7 +1640,7 @@ def find_pricesapi_offers(plan: Dict[str, Any], search_terms: List[str], csv_off
             {
                 "id": result.get("id"),
                 "title": str(result.get("title") or "").strip(),
-                "score": score_pricesapi_product(result, search_terms),
+                "score": score_pricesapi_product(result, search_terms, plan.get("requested_pack_count")),
             }
             for result in search_results
             if result.get("id") is not None
@@ -1194,7 +1656,7 @@ def find_pricesapi_offers(plan: Dict[str, Any], search_terms: List[str], csv_off
         except Exception:
             continue
         for offer in offers:
-            candidate = collect_pricesapi_offer(offer, search_terms, shortlist_keys)
+            candidate = collect_pricesapi_offer(offer, search_terms, shortlist_keys, plan.get("requested_pack_count"))
             if candidate is None:
                 continue
             retailer = str(candidate.get("retailer") or "Unknown retailer")
@@ -1224,6 +1686,7 @@ def collect_brightdata_offer(
     result: Dict[str, Any],
     search_terms: List[str],
     retailer_hint: str,
+    requested_pack_count: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     product_name = str(result.get("title") or result.get("name") or "").strip()
     if not product_name:
@@ -1239,7 +1702,12 @@ def collect_brightdata_offer(
     if price_gbp is None:
         return None
     normalized_name = normalize_text(product_name)
-    score = matching_term_score(normalized_name, search_terms)
+    score = matching_term_score(
+        normalized_name,
+        search_terms,
+        product_name=product_name,
+        requested_pack_count=requested_pack_count,
+    )
     if score <= 0:
         return None
     return {
@@ -1272,7 +1740,7 @@ def find_brightdata_shopping_offers(plan: Dict[str, Any], search_terms: List[str
             continue
         best_offer: Optional[Dict[str, Any]] = None
         for result in results:
-            offer = collect_brightdata_offer(result, search_terms, retailer)
+            offer = collect_brightdata_offer(result, search_terms, retailer, plan.get("requested_pack_count"))
             if offer is None:
                 continue
             best_offer = better_retailer_offer(best_offer, offer)
@@ -1298,12 +1766,19 @@ def find_brightdata_shopping_offers(plan: Dict[str, Any], search_terms: List[str
 
 
 def should_try_live_merchant_lookup(plan: Dict[str, Any], search_terms: List[str]) -> bool:
-    if plan.get("official_only") or plan.get("retailers"):
+    if plan.get("official_only"):
         return False
     if plan.get("query_type") not in {"retailer_comparison", "item_price_lookup"}:
         return False
     if not search_terms:
         return False
+    if plan.get("retailers"):
+        merchant_keys = {
+            normalize_retailer_key(str(source.get("retailer") or source.get("name") or ""))
+            for source in MERCHANT_SEARCH_SOURCES
+            if str(source.get("retailer") or source.get("name") or "").strip()
+        }
+        return bool(requested_retailer_keys(plan) & merchant_keys)
     return len(search_terms) >= 2 or search_terms[0] not in BROAD_ITEM_TERMS
 
 
@@ -1341,28 +1816,47 @@ def collect_live_offer(
     price_gbp: Optional[float],
     product_url: str,
     search_terms: List[str],
+    *,
+    price_unit_gbp: Optional[float] = None,
+    unit: str = "",
+    requested_pack_count: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     if price_gbp is None:
         return None
     normalized_name = normalize_text(product_name)
-    score = matching_term_score(normalized_name, search_terms)
+    score = matching_term_score(
+        normalized_name,
+        search_terms,
+        product_name=product_name,
+        requested_pack_count=requested_pack_count,
+        unit=unit,
+    )
     if score <= 0:
         return None
     if any(term in normalized_name for term in MERCHANT_EXCLUDED_TERMS if term not in search_terms):
         return None
+    if price_unit_gbp is None:
+        price_unit_gbp, derived_unit = derive_standard_unit_price(price_gbp, product_name)
+        if not unit and derived_unit:
+            unit = derived_unit
     return {
         "retailer": retailer,
         "product_name": product_name,
         "price_gbp": price_gbp,
-        "price_unit_gbp": None,
-        "unit": "",
+        "price_unit_gbp": price_unit_gbp,
+        "unit": unit,
         "capture_date": "",
         "score": score,
         "product_url": product_url,
     }
 
 
-def parse_wlfdn_shopify_results(html_text: str, source: Dict[str, str], search_terms: List[str]) -> List[Dict[str, Any]]:
+def parse_wlfdn_shopify_results(
+    html_text: str,
+    source: Dict[str, str],
+    search_terms: List[str],
+    requested_pack_count: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     offers: List[Dict[str, Any]] = []
     for match in WLFDN_PRODUCT_PUSH_RE.finditer(html_text):
         block = match.group(1)
@@ -1377,13 +1871,19 @@ def parse_wlfdn_shopify_results(html_text: str, source: Dict[str, str], search_t
             parse_amount(price_match.group(1)),
             urljoin(source["product_base_url"], handle_match.group(1).strip()),
             search_terms,
+            requested_pack_count=requested_pack_count,
         )
         if offer:
             offers.append(offer)
     return offers
 
 
-def parse_shopify_meta_results(html_text: str, source: Dict[str, str], search_terms: List[str]) -> List[Dict[str, Any]]:
+def parse_shopify_meta_results(
+    html_text: str,
+    source: Dict[str, str],
+    search_terms: List[str],
+    requested_pack_count: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     marker_index = html_text.find("var meta = ")
     if marker_index < 0:
         return []
@@ -1417,9 +1917,123 @@ def parse_shopify_meta_results(html_text: str, source: Dict[str, str], search_te
                 price_gbp,
                 urljoin(source["product_base_url"], handle),
                 search_terms,
+                requested_pack_count=requested_pack_count,
             )
             if offer:
                 offers.append(offer)
+    return offers
+
+
+def extract_live_product_page_data(url: str) -> Dict[str, Any]:
+    try:
+        html_text, final_url = fetch_url(url)
+    except Exception:
+        return {}
+    merged = merge_values(
+        extract_from_jsonld(html_text),
+        extract_from_variations(html_text),
+        extract_from_meta(html_text),
+        extract_from_title(html_text),
+    )
+    current_price = parse_amount(merged.get("current_price"))
+    if current_price is None:
+        low_price = parse_amount(merged.get("low_price"))
+        high_price = parse_amount(merged.get("high_price"))
+        if low_price is not None and high_price is not None and abs(low_price - high_price) < 1e-9:
+            current_price = low_price
+    price_unit_gbp, unit = extract_standard_unit_price_from_text(html_text)
+    if price_unit_gbp is None:
+        price_unit_gbp, unit = derive_standard_unit_price(current_price, str(merged.get("product_name") or ""))
+    return {
+        "product_name": str(merged.get("product_name") or "").strip(),
+        "product_url": str(merged.get("canonical_url") or final_url or url).strip(),
+        "price_gbp": current_price,
+        "price_unit_gbp": price_unit_gbp,
+        "unit": unit,
+    }
+
+
+def parse_costco_rest_results(
+    payload: Any,
+    source: Dict[str, str],
+    search_terms: List[str],
+    requested_pack_count: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    products = payload.get("products")
+    if not isinstance(products, list):
+        return []
+    candidates: List[Dict[str, Any]] = []
+    for product in products:
+        if not isinstance(product, dict):
+            continue
+        product_name = str(product.get("name") or "").strip()
+        if not product_name:
+            continue
+        normalized_name = normalize_text(product_name)
+        score = matching_term_score(
+            normalized_name,
+            search_terms,
+            product_name=product_name,
+            requested_pack_count=requested_pack_count,
+        )
+        if score <= 0:
+            continue
+        if any(term in normalized_name for term in MERCHANT_EXCLUDED_TERMS if term not in search_terms):
+            continue
+        price_info = product.get("price")
+        price_gbp = None
+        if isinstance(price_info, dict):
+            price_gbp = parse_amount(price_info.get("value"))
+            if price_gbp is None:
+                price_gbp = parse_amount(price_info.get("formattedValue"))
+        product_path = str(product.get("url") or "").strip()
+        candidates.append(
+            {
+                "product_name": product_name,
+                "product_url": urljoin(source["product_base_url"], product_path),
+                "price_gbp": price_gbp,
+                "score": score,
+            }
+        )
+    if not candidates:
+        return []
+    ranked_candidates = sorted(
+        candidates,
+        key=lambda candidate: (
+            -int(candidate.get("score", 0)),
+            candidate.get("price_gbp") is None,
+            str(candidate.get("product_name") or ""),
+        ),
+    )[:MERCHANT_PRODUCT_PAGE_FETCH_LIMIT]
+    offers: List[Dict[str, Any]] = []
+    for candidate in ranked_candidates:
+        product_name = str(candidate.get("product_name") or "").strip()
+        product_url = str(candidate.get("product_url") or "").strip()
+        price_gbp = parse_amount(candidate.get("price_gbp"))
+        price_unit_gbp, unit = derive_standard_unit_price(price_gbp, product_name)
+        if price_gbp is None and product_url:
+            page_data = extract_live_product_page_data(product_url)
+            if page_data.get("product_name"):
+                product_name = str(page_data["product_name"])
+            if page_data.get("product_url"):
+                product_url = str(page_data["product_url"])
+            price_gbp = parse_amount(page_data.get("price_gbp"))
+            price_unit_gbp = parse_amount(page_data.get("price_unit_gbp"))
+            unit = str(page_data.get("unit") or "").strip()
+        offer = collect_live_offer(
+            source["name"],
+            product_name,
+            price_gbp,
+            product_url,
+            search_terms,
+            price_unit_gbp=price_unit_gbp,
+            unit=unit,
+            requested_pack_count=requested_pack_count,
+        )
+        if offer:
+            offers.append(offer)
     return offers
 
 
@@ -1430,18 +2044,29 @@ def find_live_merchant_offers(plan: Dict[str, Any], search_terms: List[str]) -> 
     parsers = {
         "wlfdn_shopify": parse_wlfdn_shopify_results,
         "shopify_meta": parse_shopify_meta_results,
+        "costco_rest_json": parse_costco_rest_results,
     }
     best_by_retailer: Dict[str, Dict[str, Any]] = {}
     for source in MERCHANT_SEARCH_SOURCES:
+        source_retailer = str(source.get("retailer") or source.get("name") or "").strip()
+        if plan.get("retailers") and source_retailer and not retailer_requested(plan, source_retailer):
+            continue
+        if not plan.get("retailers") and len(search_terms) < int(source.get("min_search_terms", 1)):
+            continue
         parser = parsers.get(source.get("parser", ""))
         if parser is None:
             continue
         search_url = source["search_url"].format(query=query)
         try:
-            html_text, _ = fetch_url(search_url)
+            if source.get("response_type") == "json":
+                payload, _ = fetch_json_url(search_url)
+                parsed_offers = parser(payload, source, search_terms, plan.get("requested_pack_count"))
+            else:
+                html_text, _ = fetch_url(search_url)
+                parsed_offers = parser(html_text, source, search_terms, plan.get("requested_pack_count"))
         except Exception:
             continue
-        for offer in parser(html_text, source, search_terms):
+        for offer in parsed_offers:
             retailer = str(offer.get("retailer") or "Unknown retailer")
             best_by_retailer[retailer] = better_retailer_offer(best_by_retailer.get(retailer), offer)
     if not best_by_retailer:
@@ -1470,7 +2095,7 @@ def find_csv_direct_item_offers(plan: Dict[str, Any], search_terms: List[str]) -
     with COMMUNITY_DATASET_CSV_PATH.open(newline='', encoding='utf-8') as handle:
         reader = csv.DictReader(handle)
         for row in reader:
-            offer = collect_offer_candidate(row, search_terms)
+            offer = collect_offer_candidate(row, search_terms, plan.get("requested_pack_count"))
             if not offer or not retailer_requested(plan, str(offer.get("retailer") or "")):
                 continue
             retailer = str(offer.get("retailer") or "Unknown retailer")
@@ -1536,6 +2161,15 @@ def direct_lookup_matched_sources(offers: List[Dict[str, Any]]) -> List[str]:
     return [SOURCE_MAP["community_supermarket_dataset"].name]
 
 
+def direct_lookup_comparison_basis(offers: List[Dict[str, Any]]) -> str:
+    units = ordered_unique(str(offer.get("unit") or "").strip() for offer in offers if offer.get("price_unit_gbp") is not None and str(offer.get("unit") or "").strip())
+    if not units:
+        return "shelf price only"
+    if len(units) == 1:
+        return f"standardized £/{units[0]}, then shelf price"
+    return "standardized unit price where available, then shelf price"
+
+
 def build_direct_item_reply(plan: Dict[str, Any], offers: List[Dict[str, Any]]) -> str:
     terms = extract_item_terms(plan)
     source_key = direct_lookup_source_key(offers)
@@ -1562,6 +2196,7 @@ def build_direct_item_reply(plan: Dict[str, Any], offers: List[Dict[str, Any]]) 
         lines.append("Best matched live offers from retailer search pages:")
     else:
         lines.append("Best retailer matches from community dataset:")
+    lines.append(f"Comparison basis: {direct_lookup_comparison_basis(offers)}")
     for idx, offer in enumerate(offers, start=1):
         price_text = format_amount("GBP", offer.get("price_gbp"))
         unit_price = offer.get("price_unit_gbp")
@@ -1569,6 +2204,8 @@ def build_direct_item_reply(plan: Dict[str, Any], offers: List[Dict[str, Any]]) 
         if unit_price is not None and unit:
             price_text += f" ({format_amount('GBP', unit_price)}/{unit})"
         line = f"{idx}. {offer.get('retailer')}: {offer.get('product_name')} - {price_text}"
+        if offer.get("is_own_brand"):
+            line += " - own brand"
         capture_date = str(offer.get("capture_date") or "")[:10]
         if capture_date:
             line += f" - captured {capture_date}"
@@ -1652,6 +2289,7 @@ def classify_query(text: str) -> Dict[str, Any]:
     else:
         query_type = "item_price_lookup"
     needs_live = bool(token_set & LIVE_PRICE_KEYWORDS) or query_type in {"retailer_comparison", "item_price_lookup"}
+    requested_pack_count = extract_requested_pack_count(text)
     noise = QUERY_NOISE | set(RETAILER_ALIASES.keys()) | BASKET_KEYWORDS | TREND_KEYWORDS | LOCATION_KEYWORDS | VALUE_KEYWORDS | LIVE_PRICE_KEYWORDS | OFFICIAL_ONLY_KEYWORDS
     focus_terms = ordered_unique(token for token in tokens if len(token) > 2 and token not in noise and not token.isdigit())[:4]
     search_anchor, used_default_postcode = extract_search_anchor(text, focus_terms, query_type)
@@ -1662,6 +2300,7 @@ def classify_query(text: str) -> Dict[str, Any]:
         "needs_live": needs_live,
         "retailers": retailers,
         "focus_terms": focus_terms,
+        "requested_pack_count": requested_pack_count,
         "search_anchor": search_anchor,
         "used_default_postcode": used_default_postcode,
         "text": text.strip(),
@@ -1846,6 +2485,7 @@ def analyze_product_payload(raw_text: str) -> PriceResult:
             extract_from_jsonld(source.content),
             extract_from_variations(source.content),
             extract_from_meta(source.content),
+            extract_from_known_retailer_html(source.content, source.canonical_url or source.source_label),
             extract_from_title(source.content),
             extract_amounts_from_text(source.content),
         )
