@@ -5,7 +5,9 @@ Springfield Price Bot is an OpenClaw-compatible Telegram bot workspace for UK fo
 ## What It Does
 
 - Accepts plain-English UK food price questions and routes them to the strongest matching data source.
-- Checks recent cached item-level results first to avoid repeated crawling for the same query.
+- Checks recent cached item-level results first (24-hour default TTL) to avoid repeated crawling for the same query.
+- Archives expired item-cache rows into SQLite history for longer-term price trend analysis.
+- Migrates CSV snapshot rows into SQLite history tables so CSV fallback is managed from one central store.
 - Uses the Kaggle-derived CSV snapshot as the final fallback when live sources cannot return a qualifying match.
 - Normalizes price-per-unit comparison where possible, so results can rank on `£/kg`, `£/l`, or `£/each` instead of only shelf price.
 - Attempts live item-level retailer comparisons from reachable retailer search pages or retailer JSON search endpoints next, including live supermarket comparisons through Trolley.
@@ -92,6 +94,7 @@ Optional:
 - `SPRINGFIELD_PRICE_CACHE_HTML_TTL_SEC` optional HTML cache TTL override
 - `SPRINGFIELD_PRICE_CACHE_JSON_TTL_SEC` optional JSON page cache TTL override
 - `SPRINGFIELD_PRICE_CACHE_API_TTL_SEC` optional API cache TTL override for PricesAPI and Bright Data
+- `SPRINGFIELD_PRICE_CACHE_ITEM_TTL_SEC` optional item-lookup cache TTL override, default `86400` (24 hours)
 - `SPRINGFIELD_PRICE_PRICESAPI_KEY` PricesAPI key for live catalog/offers lookup
 - `SPRINGFIELD_PRICE_PRICESAPI_COUNTRY` optional, defaults to `uk`
 - `SPRINGFIELD_PRICE_BRIGHTDATA_API_KEY` Bright Data API token for live Google Shopping lookups
@@ -105,10 +108,11 @@ Optional:
 The direct item lookup order is:
 
 1. recent item-level cache hit (if available)
-2. reachable live retailer/supermarket sources (including Trolley)
+2. after item-cache expiry, refresh by trying a different live source first
 3. PricesAPI live offers for the top CSV retailers when configured
 4. Bright Data Google Shopping live offers for the top CSV retailers when configured
-5. CSV snapshot fallback
+5. reachable live retailer/supermarket sources (including Trolley)
+6. CSV snapshot fallback (served from migrated SQLite history rows)
 
 Current live retailer-search sources:
 
@@ -117,7 +121,7 @@ Current live retailer-search sources:
 - Fine Food Specialist
 - Costco UK via `rest/v2/uk/products/search`, with a product-page price fallback when the JSON search result omits price
 
-Recent live searches are cached in SQLite so repeated item lookups do not refetch the same retailer pages and API responses over and over again. The cache sits under the fetch/API layer, so reply generation still reruns normally while recent HTML/JSON/API payloads are reused.
+Recent live searches are cached in SQLite so repeated item lookups do not refetch the same retailer pages and API responses over and over again. Stale item-cache entries are archived into `price_history` before deletion, and CSV rows are migrated into the same SQLite history domain (tracked by `history_import_state`) for centralized management.
 
 Comparison-function implementation notes:
 

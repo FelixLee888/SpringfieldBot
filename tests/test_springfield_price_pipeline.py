@@ -736,46 +736,181 @@ class SpringfieldPricePipelineTest(unittest.TestCase):
         self.assertNotIn("dinner", plan["focus_terms"])
 
     def test_cached_item_lookup_short_circuits_live_and_csv(self):
-        old_cache_get = module.cache_get
+        old_cache_state = module.load_item_lookup_cache_state
         old_live = module.find_live_merchant_offers
         old_csv = module.find_csv_direct_item_offers
 
-        def fake_cache_get(namespace, payload):
-            if namespace != "item_lookup_result":
-                return None
+        def fake_cache_state(plan, terms):
             return (
-                module.json.dumps({
-                    "offers": [
-                        {
-                            "retailer": "Costco",
-                            "product_name": "Shen Dan Boiled Salted Duck Eggs x 12",
-                            "price_gbp": 5.49,
-                            "price_unit_gbp": 0.46,
-                            "unit": "each",
-                            "score": 4,
-                            "product_url": "https://www.costco.co.uk/example-eggs",
-                            "lookup_source_key": "retailer_search_pages",
-                            "lookup_source_name": "Retailer search pages",
-                            "lookup_source_url": "",
-                        }
-                    ]
-                }, sort_keys=True),
+                [
+                    {
+                        "retailer": "Costco",
+                        "product_name": "Shen Dan Boiled Salted Duck Eggs x 12",
+                        "price_gbp": 5.49,
+                        "price_unit_gbp": 0.46,
+                        "unit": "each",
+                        "score": 4,
+                        "product_url": "https://www.costco.co.uk/example-eggs",
+                        "lookup_source_key": "retailer_search_pages",
+                        "lookup_source_name": "Retailer search pages",
+                        "lookup_source_url": "",
+                        "cache_hit": True,
+                    }
+                ],
                 "",
             )
 
-        module.cache_get = fake_cache_get
+        module.load_item_lookup_cache_state = fake_cache_state
         module.find_live_merchant_offers = lambda plan, terms: (_ for _ in ()).throw(AssertionError("live lookup should not run"))
         module.find_csv_direct_item_offers = lambda plan, terms: (_ for _ in ()).throw(AssertionError("csv lookup should not run"))
         try:
             result = module.analyze_payload("I want to buy a box of 12 eggs")
         finally:
-            module.cache_get = old_cache_get
+            module.load_item_lookup_cache_state = old_cache_state
             module.find_live_merchant_offers = old_live
             module.find_csv_direct_item_offers = old_csv
         self.assertTrue(result.ok)
         self.assertEqual(result.source, "Retailer search pages")
         self.assertIn("Recent cached live offers from retailer search pages", result.reply_message)
         self.assertIn("Shen Dan Boiled Salted Duck Eggs x 12 - £5.49 (£0.46/each)", result.reply_message)
+
+    def test_item_lookup_cache_ttl_defaults_to_24_hours(self):
+        old_item_ttl = module.os.environ.pop("SPRINGFIELD_PRICE_CACHE_ITEM_TTL_SEC", None)
+        try:
+            self.assertEqual(module.cache_ttl_seconds("item_lookup_result"), 86400)
+        finally:
+            if old_item_ttl is not None:
+                module.os.environ["SPRINGFIELD_PRICE_CACHE_ITEM_TTL_SEC"] = old_item_ttl
+
+    def test_stale_item_cache_is_archived_and_refresh_prefers_different_source(self):
+        plan = module.classify_query("I want to buy a box of 12 eggs")
+        terms = module.extract_item_terms(plan)
+        stale_offers = [
+            {
+                "retailer": "Tesco",
+                "product_name": "Tesco Medium Eggs x12",
+                "price_gbp": 2.85,
+                "price_unit_gbp": 0.24,
+                "unit": "each",
+                "score": 3,
+                "lookup_source_key": "retailer_search_pages",
+                "lookup_source_name": "Retailer search pages",
+                "lookup_source_url": "",
+            }
+        ]
+        module.cache_put(
+            "item_lookup_result",
+            module.item_lookup_cache_payload(plan, terms),
+            module.json.dumps({"offers": stale_offers}, sort_keys=True),
+            "",
+            ttl_seconds=60,
+        )
+        now = int(module.time.time())
+        connection = module.open_cache_db()
+        try:
+            connection.execute(
+                "UPDATE request_cache SET expires_at = ? WHERE namespace = ?",
+                (now - 1, "item_lookup_result"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        old_live = module.find_live_merchant_offers
+        old_prices = module.find_pricesapi_offers
+        old_bright = module.find_brightdata_shopping_offers
+        old_csv = module.find_csv_direct_item_offers
+        calls = []
+
+        module.find_live_merchant_offers = lambda p, t: calls.append("live") or []
+        module.find_csv_direct_item_offers = lambda p, t: [
+            {
+                "retailer": "Tesco",
+                "product_name": "Tesco Eggs",
+                "price_gbp": 2.9,
+                "price_unit_gbp": 5.8,
+                "unit": "dozen",
+                "capture_date": "2024-04-11T00:00:00",
+                "score": 3,
+                "lookup_source_key": "community_supermarket_dataset",
+            }
+        ]
+        module.find_pricesapi_offers = lambda p, t, c: calls.append("pricesapi") or [
+            {
+                "retailer": "Tesco",
+                "product_name": "Tesco Medium Free Range Eggs x12",
+                "price_gbp": 2.95,
+                "price_unit_gbp": None,
+                "unit": "",
+                "capture_date": "",
+                "score": 3,
+                "product_url": "https://example.com/eggs",
+                "lookup_source_key": "pricesapi_live_offers",
+                "lookup_source_name": "PricesAPI live offers",
+                "lookup_source_url": module.PRICESAPI_DOCS_URL,
+            }
+        ]
+        module.find_brightdata_shopping_offers = lambda p, t, c: calls.append("brightdata") or []
+        try:
+            offers = module.find_direct_item_offers(plan)
+        finally:
+            module.find_live_merchant_offers = old_live
+            module.find_pricesapi_offers = old_prices
+            module.find_brightdata_shopping_offers = old_bright
+            module.find_csv_direct_item_offers = old_csv
+
+        self.assertTrue(offers)
+        self.assertEqual(calls[0], "pricesapi")
+        self.assertEqual(offers[0]["lookup_source_key"], "pricesapi_live_offers")
+        self.assertEqual(offers[0]["refreshed_after_stale_source"], "retailer_search_pages")
+        connection = module.open_cache_db()
+        try:
+            archived = connection.execute(
+                "SELECT COUNT(*) AS total FROM price_history WHERE origin = 'item_cache_stale'"
+            ).fetchone()
+            self.assertGreater(int(archived["total"]), 0)
+        finally:
+            connection.close()
+
+    def test_csv_rows_migrate_to_history_and_remain_queryable(self):
+        with TemporaryDirectory() as tmpdir:
+            csv_path = Path(tmpdir) / "community_supermarket_latest.csv"
+            csv_path.write_text(
+                "supermarket_name,price_gbp,price_unit_gbp,unit,product_name,normalized_product_name,capture_date,category_name,is_own_brand\n"
+                "Tesco,2.6,5.2,dozen,Tesco Eggs,tesco eggs,2024-04-10T00:00:00,fresh_food,true\n"
+                "ASDA,2.4,4.8,dozen,ASDA Eggs,asda eggs,2024-04-11T00:00:00,fresh_food,true\n",
+                encoding="utf-8",
+            )
+            old_path = module.COMMUNITY_DATASET_CSV_PATH
+            module.COMMUNITY_DATASET_CSV_PATH = csv_path
+            try:
+                plan = module.classify_query("Where can I compare the best value eggs across Tesco and ASDA this week?")
+                terms = module.extract_item_terms(plan)
+                first = module.find_csv_direct_item_offers(plan, terms)
+                dataset_key = module.csv_history_dataset_key(csv_path)
+                connection = module.open_cache_db()
+                try:
+                    state = connection.execute(
+                        "SELECT source_fingerprint, row_count FROM history_import_state WHERE dataset_key = ?",
+                        (dataset_key,),
+                    ).fetchone()
+                    migrated_rows = connection.execute(
+                        "SELECT COUNT(*) AS total FROM price_history WHERE origin = 'csv_snapshot' AND dataset_key = ?",
+                        (dataset_key,),
+                    ).fetchone()
+                finally:
+                    connection.close()
+                csv_path.unlink()
+                second = module.find_csv_direct_item_offers(plan, terms)
+            finally:
+                module.COMMUNITY_DATASET_CSV_PATH = old_path
+
+        self.assertTrue(first)
+        self.assertTrue(second)
+        self.assertEqual(first[0]["retailer"], second[0]["retailer"])
+        self.assertIsNotNone(state)
+        self.assertEqual(int(state["row_count"]), 2)
+        self.assertGreater(int(migrated_rows["total"]), 0)
 
     def test_box_of_12_eggs_prefers_real_egg_packs(self):
         with TemporaryDirectory() as tmpdir:

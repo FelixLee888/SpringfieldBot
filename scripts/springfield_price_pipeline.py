@@ -42,6 +42,7 @@ DEFAULT_TIMEOUT = float(os.getenv("SPRINGFIELD_PRICE_FETCH_TIMEOUT_SEC", "20"))
 DEFAULT_LOCATION_POSTCODE = os.getenv("SPRINGFIELD_PRICE_DEFAULT_POSTCODE", "PA2 0SG").strip() or "PA2 0SG"
 CACHE_DB_DEFAULT_PATH = Path(__file__).resolve().parent.parent / "data" / "search_cache.sqlite3"
 CACHE_DEFAULT_TTL_SEC = int(os.getenv("SPRINGFIELD_PRICE_CACHE_TTL_SEC", "14400"))
+ITEM_CACHE_DEFAULT_TTL_SEC = 24 * 60 * 60
 URL_RE = re.compile(r"https?://[^\s<>'\"]+")
 WORD_RE = re.compile(r"[a-z0-9']+")
 UK_POSTCODE_RE = re.compile(r"\b([A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2})\b", re.IGNORECASE)
@@ -94,6 +95,10 @@ _CACHE_NAMESPACE_TTLS = {
     "brightdata_shopping": "SPRINGFIELD_PRICE_CACHE_API_TTL_SEC",
     "item_lookup_result": "SPRINGFIELD_PRICE_CACHE_ITEM_TTL_SEC",
 }
+_CACHE_NAMESPACE_DEFAULT_TTLS = {
+    "item_lookup_result": ITEM_CACHE_DEFAULT_TTL_SEC,
+}
+CSV_HISTORY_DATASET_PREFIX = "community_supermarket_csv::"
 
 QUERY_LABELS = {
     "retailer_comparison": "Retailer comparison",
@@ -449,8 +454,8 @@ def cache_ttl_seconds(namespace: str) -> int:
         try:
             return max(0, int(raw))
         except ValueError:
-            return CACHE_DEFAULT_TTL_SEC
-    return CACHE_DEFAULT_TTL_SEC
+            return _CACHE_NAMESPACE_DEFAULT_TTLS.get(namespace, CACHE_DEFAULT_TTL_SEC)
+    return _CACHE_NAMESPACE_DEFAULT_TTLS.get(namespace, CACHE_DEFAULT_TTL_SEC)
 
 
 def stable_cache_key(namespace: str, payload: Dict[str, Any]) -> Tuple[str, str]:
@@ -482,7 +487,178 @@ def open_cache_db() -> sqlite3.Connection:
         """
     )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_request_cache_expires_at ON request_cache (expires_at)")
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS price_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            origin TEXT NOT NULL,
+            dataset_key TEXT NOT NULL DEFAULT '',
+            dataset_fingerprint TEXT NOT NULL DEFAULT '',
+            namespace TEXT NOT NULL DEFAULT '',
+            cache_key TEXT NOT NULL DEFAULT '',
+            request_fingerprint TEXT NOT NULL DEFAULT '',
+            retailer TEXT NOT NULL DEFAULT '',
+            product_name TEXT NOT NULL DEFAULT '',
+            normalized_product_name TEXT NOT NULL DEFAULT '',
+            price_gbp REAL,
+            price_unit_gbp REAL,
+            unit TEXT NOT NULL DEFAULT '',
+            capture_date TEXT NOT NULL DEFAULT '',
+            category_name TEXT NOT NULL DEFAULT '',
+            is_own_brand INTEGER NOT NULL DEFAULT 0,
+            product_url TEXT NOT NULL DEFAULT '',
+            source_key TEXT NOT NULL DEFAULT '',
+            source_name TEXT NOT NULL DEFAULT '',
+            source_url TEXT NOT NULL DEFAULT '',
+            fetched_at INTEGER NOT NULL DEFAULT 0,
+            expires_at INTEGER NOT NULL DEFAULT 0,
+            observed_at INTEGER NOT NULL DEFAULT 0,
+            record_hash TEXT NOT NULL UNIQUE,
+            raw_offer_json TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '{}'
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_price_history_origin_dataset ON price_history (origin, dataset_key, dataset_fingerprint)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_price_history_name ON price_history (normalized_product_name, retailer)"
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS history_import_state (
+            dataset_key TEXT PRIMARY KEY,
+            source_path TEXT NOT NULL DEFAULT '',
+            source_fingerprint TEXT NOT NULL DEFAULT '',
+            row_count INTEGER NOT NULL DEFAULT 0,
+            imported_at INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
     return connection
+
+
+def parse_cached_item_lookup_offers(body_text: str, *, mark_cache_hit: bool = False) -> List[Dict[str, Any]]:
+    try:
+        payload = json.loads(body_text)
+    except ValueError:
+        return []
+    offers = payload.get("offers")
+    if not isinstance(offers, list):
+        return []
+    restored: List[Dict[str, Any]] = []
+    for offer in offers:
+        if not isinstance(offer, dict):
+            continue
+        restored_offer = dict(offer)
+        if mark_cache_hit:
+            restored_offer["cache_hit"] = True
+        restored.append(restored_offer)
+    return restored
+
+
+def archive_item_lookup_cache_row(connection: sqlite3.Connection, row: sqlite3.Row, archived_at: int) -> str:
+    offers = parse_cached_item_lookup_offers(str(row["body_text"] or ""))
+    if not offers:
+        return ""
+    source_key = str(offers[0].get("lookup_source_key") or "")
+    source_name = str(offers[0].get("lookup_source_name") or "")
+    source_url = str(offers[0].get("lookup_source_url") or row["response_url"] or "")
+    metadata_base = {
+        "cache_namespace": str(row["namespace"] or ""),
+        "cache_key": str(row["cache_key"] or ""),
+        "request_fingerprint": str(row["request_fingerprint"] or ""),
+    }
+    for index, offer in enumerate(offers):
+        offer_json = json.dumps(offer, sort_keys=True, ensure_ascii=True)
+        record_hash = hashlib.sha256(
+            f"item_cache_stale:{row['cache_key']}:{row['expires_at']}:{index}:{offer_json}".encode("utf-8")
+        ).hexdigest()
+        product_name = str(offer.get("product_name") or "").strip()
+        retailer = retailer_display_name(str(offer.get("retailer") or "").strip())
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO price_history (
+                origin,
+                namespace,
+                cache_key,
+                request_fingerprint,
+                retailer,
+                product_name,
+                normalized_product_name,
+                price_gbp,
+                price_unit_gbp,
+                unit,
+                capture_date,
+                category_name,
+                is_own_brand,
+                product_url,
+                source_key,
+                source_name,
+                source_url,
+                fetched_at,
+                expires_at,
+                observed_at,
+                record_hash,
+                raw_offer_json,
+                metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "item_cache_stale",
+                str(row["namespace"] or ""),
+                str(row["cache_key"] or ""),
+                str(row["request_fingerprint"] or ""),
+                retailer,
+                product_name,
+                normalize_text(product_name),
+                parse_amount(offer.get("price_gbp")),
+                parse_amount(offer.get("price_unit_gbp")),
+                str(offer.get("unit") or "").strip(),
+                str(offer.get("capture_date") or "").strip(),
+                str(offer.get("category_name") or "").strip().lower(),
+                1 if str(offer.get("is_own_brand") or "").strip().lower() in {"1", "true", "yes"} else 0,
+                str(offer.get("product_url") or "").strip(),
+                str(offer.get("lookup_source_key") or source_key),
+                str(offer.get("lookup_source_name") or source_name),
+                str(offer.get("lookup_source_url") or source_url),
+                int(row["fetched_at"] or 0),
+                int(row["expires_at"] or 0),
+                archived_at,
+                record_hash,
+                offer_json,
+                json.dumps(metadata_base, sort_keys=True),
+            ),
+        )
+    return source_key
+
+
+def purge_expired_cache_rows(
+    connection: sqlite3.Connection,
+    now: int,
+    *,
+    skip_entry: Optional[Tuple[str, str]] = None,
+) -> None:
+    rows = connection.execute(
+        """
+        SELECT namespace, cache_key, request_fingerprint, response_url, body_text, fetched_at, expires_at
+        FROM request_cache
+        WHERE expires_at <= ?
+        """,
+        (now,),
+    ).fetchall()
+    for row in rows:
+        namespace = str(row["namespace"] or "")
+        cache_key = str(row["cache_key"] or "")
+        if skip_entry and (namespace, cache_key) == skip_entry:
+            continue
+        if namespace == "item_lookup_result":
+            archive_item_lookup_cache_row(connection, row, now)
+        connection.execute(
+            "DELETE FROM request_cache WHERE namespace = ? AND cache_key = ?",
+            (namespace, cache_key),
+        )
 
 
 def cache_get(namespace: str, payload: Dict[str, Any]) -> Optional[Tuple[str, str]]:
@@ -492,7 +668,7 @@ def cache_get(namespace: str, payload: Dict[str, Any]) -> Optional[Tuple[str, st
     now = int(time.time())
     connection = open_cache_db()
     try:
-        connection.execute("DELETE FROM request_cache WHERE expires_at <= ?", (now,))
+        purge_expired_cache_rows(connection, now)
         row = connection.execute(
             """
             SELECT body_text, response_url
@@ -582,26 +758,46 @@ def item_lookup_cache_payload(plan: Dict[str, Any], search_terms: List[str]) -> 
     }
 
 
-def load_cached_item_lookup(plan: Dict[str, Any], search_terms: List[str]) -> List[Dict[str, Any]]:
-    cached = cache_get("item_lookup_result", item_lookup_cache_payload(plan, search_terms))
-    if cached is None:
-        return []
-    body_text, _ = cached
+def load_item_lookup_cache_state(plan: Dict[str, Any], search_terms: List[str]) -> Tuple[List[Dict[str, Any]], str]:
+    if not cache_enabled():
+        return [], ""
+    payload = item_lookup_cache_payload(plan, search_terms)
+    cache_key, _ = stable_cache_key("item_lookup_result", payload)
+    now = int(time.time())
+    stale_source_key = ""
+    connection = open_cache_db()
     try:
-        payload = json.loads(body_text)
-    except ValueError:
-        return []
-    offers = payload.get("offers")
-    if not isinstance(offers, list):
-        return []
-    restored: List[Dict[str, Any]] = []
-    for offer in offers:
-        if not isinstance(offer, dict):
-            continue
-        restored_offer = dict(offer)
-        restored_offer["cache_hit"] = True
-        restored.append(restored_offer)
-    return restored
+        row = connection.execute(
+            """
+            SELECT namespace, cache_key, request_fingerprint, response_url, body_text, fetched_at, expires_at
+            FROM request_cache
+            WHERE namespace = ? AND cache_key = ?
+            """,
+            ("item_lookup_result", cache_key),
+        ).fetchone()
+        if row is not None and int(row["expires_at"] or 0) > now:
+            connection.execute(
+                """
+                UPDATE request_cache
+                SET last_accessed_at = ?, hit_count = hit_count + 1
+                WHERE namespace = ? AND cache_key = ?
+                """,
+                (now, "item_lookup_result", cache_key),
+            )
+            purge_expired_cache_rows(connection, now, skip_entry=("item_lookup_result", cache_key))
+            connection.commit()
+            return parse_cached_item_lookup_offers(str(row["body_text"] or ""), mark_cache_hit=True), ""
+        if row is not None:
+            stale_source_key = archive_item_lookup_cache_row(connection, row, now)
+            connection.execute(
+                "DELETE FROM request_cache WHERE namespace = ? AND cache_key = ?",
+                ("item_lookup_result", cache_key),
+            )
+        purge_expired_cache_rows(connection, now)
+        connection.commit()
+    finally:
+        connection.close()
+    return [], stale_source_key
 
 
 def store_cached_item_lookup(plan: Dict[str, Any], search_terms: List[str], offers: List[Dict[str, Any]]) -> None:
@@ -2269,18 +2465,188 @@ def find_live_merchant_offers(plan: Dict[str, Any], search_terms: List[str]) -> 
     )
 
 
+def csv_history_dataset_key(csv_path: Path) -> str:
+    return f"{CSV_HISTORY_DATASET_PREFIX}{str(csv_path.expanduser().resolve())}"
+
+
+def csv_history_fingerprint(csv_path: Path) -> str:
+    stat = csv_path.stat()
+    payload = f"{csv_path.expanduser().resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def latest_csv_history_fingerprint(connection: sqlite3.Connection, dataset_key: str) -> str:
+    row = connection.execute(
+        "SELECT source_fingerprint FROM history_import_state WHERE dataset_key = ?",
+        (dataset_key,),
+    ).fetchone()
+    if row is None:
+        return ""
+    return str(row["source_fingerprint"] or "")
+
+
+def ensure_csv_history_migrated(csv_path: Path) -> str:
+    dataset_key = csv_history_dataset_key(csv_path)
+    connection = open_cache_db()
+    now = int(time.time())
+    try:
+        latest_fingerprint = latest_csv_history_fingerprint(connection, dataset_key)
+        if not csv_path.exists():
+            return latest_fingerprint
+        fingerprint = csv_history_fingerprint(csv_path)
+        if fingerprint == latest_fingerprint:
+            return fingerprint
+        source_name = SOURCE_MAP["community_supermarket_dataset"].name
+        source_url = SOURCE_MAP["community_supermarket_dataset"].url
+        row_count = 0
+        with csv_path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            for line_number, row in enumerate(reader, start=2):
+                product_name = str(row.get("product_name") or "").strip()
+                normalized_name = str(row.get("normalized_product_name") or normalize_text(product_name)).strip()
+                retailer = retailer_display_name(str(row.get("supermarket_name") or row.get("retailer") or "").strip())
+                metadata = {
+                    "line_number": line_number,
+                    "source_path": str(csv_path),
+                }
+                record_hash = hashlib.sha256(
+                    f"csv_snapshot:{dataset_key}:{fingerprint}:{line_number}".encode("utf-8")
+                ).hexdigest()
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO price_history (
+                        origin,
+                        dataset_key,
+                        dataset_fingerprint,
+                        namespace,
+                        cache_key,
+                        request_fingerprint,
+                        retailer,
+                        product_name,
+                        normalized_product_name,
+                        price_gbp,
+                        price_unit_gbp,
+                        unit,
+                        capture_date,
+                        category_name,
+                        is_own_brand,
+                        product_url,
+                        source_key,
+                        source_name,
+                        source_url,
+                        fetched_at,
+                        expires_at,
+                        observed_at,
+                        record_hash,
+                        raw_offer_json,
+                        metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "csv_snapshot",
+                        dataset_key,
+                        fingerprint,
+                        "",
+                        "",
+                        "",
+                        retailer,
+                        product_name,
+                        normalized_name,
+                        parse_amount(row.get("price_gbp")),
+                        parse_amount(row.get("price_unit_gbp")),
+                        str(row.get("unit") or "").strip(),
+                        str(row.get("capture_date") or "").strip(),
+                        str(row.get("category_name") or "").strip().lower(),
+                        1 if str(row.get("is_own_brand") or "").strip().lower() in {"1", "true", "yes"} else 0,
+                        "",
+                        "community_supermarket_dataset",
+                        source_name,
+                        source_url,
+                        0,
+                        0,
+                        now,
+                        record_hash,
+                        json.dumps(row, sort_keys=True),
+                        json.dumps(metadata, sort_keys=True),
+                    ),
+                )
+                row_count += 1
+        connection.execute(
+            """
+            INSERT INTO history_import_state (dataset_key, source_path, source_fingerprint, row_count, imported_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(dataset_key) DO UPDATE SET
+                source_path = excluded.source_path,
+                source_fingerprint = excluded.source_fingerprint,
+                row_count = excluded.row_count,
+                imported_at = excluded.imported_at
+            """,
+            (dataset_key, str(csv_path), fingerprint, row_count, now),
+        )
+        connection.commit()
+        return fingerprint
+    finally:
+        connection.close()
+
+
 def find_csv_direct_item_offers(plan: Dict[str, Any], search_terms: List[str]) -> List[Dict[str, Any]]:
-    if not COMMUNITY_DATASET_CSV_PATH.exists():
+    dataset_key = csv_history_dataset_key(COMMUNITY_DATASET_CSV_PATH)
+    fingerprint = ensure_csv_history_migrated(COMMUNITY_DATASET_CSV_PATH)
+    if not fingerprint:
         return []
+    primary_term = search_terms[0] if search_terms else ""
+    connection = open_cache_db()
+    try:
+        if primary_term:
+            rows = connection.execute(
+                """
+                SELECT
+                    retailer AS supermarket_name,
+                    product_name,
+                    normalized_product_name,
+                    price_gbp,
+                    price_unit_gbp,
+                    unit,
+                    capture_date,
+                    category_name,
+                    is_own_brand
+                FROM price_history
+                WHERE origin = 'csv_snapshot'
+                  AND dataset_key = ?
+                  AND dataset_fingerprint = ?
+                  AND normalized_product_name LIKE ?
+                """,
+                (dataset_key, fingerprint, f"%{primary_term}%"),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT
+                    retailer AS supermarket_name,
+                    product_name,
+                    normalized_product_name,
+                    price_gbp,
+                    price_unit_gbp,
+                    unit,
+                    capture_date,
+                    category_name,
+                    is_own_brand
+                FROM price_history
+                WHERE origin = 'csv_snapshot'
+                  AND dataset_key = ?
+                  AND dataset_fingerprint = ?
+                """,
+                (dataset_key, fingerprint),
+            ).fetchall()
+    finally:
+        connection.close()
     best_by_retailer: Dict[str, Dict[str, Any]] = {}
-    with COMMUNITY_DATASET_CSV_PATH.open(newline='', encoding='utf-8') as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            offer = collect_offer_candidate(row, search_terms, plan.get("requested_pack_count"))
-            if not offer or not retailer_requested(plan, str(offer.get("retailer") or "")):
-                continue
-            retailer = str(offer.get("retailer") or "Unknown retailer")
-            best_by_retailer[retailer] = better_retailer_offer(best_by_retailer.get(retailer), offer)
+    for row in rows:
+        offer = collect_offer_candidate(dict(row), search_terms, plan.get("requested_pack_count"))
+        if not offer or not retailer_requested(plan, str(offer.get("retailer") or "")):
+            continue
+        retailer = str(offer.get("retailer") or "Unknown retailer")
+        best_by_retailer[retailer] = better_retailer_offer(best_by_retailer.get(retailer), offer)
     ranked = sorted(
         best_by_retailer.values(),
         key=lambda offer: (
@@ -2302,22 +2668,26 @@ def find_direct_item_offers(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not should_try_direct_item_lookup(plan):
         return []
     search_terms = extract_item_terms(plan)
-    cached_offers = load_cached_item_lookup(plan, search_terms)
+    cached_offers, stale_source_key = load_item_lookup_cache_state(plan, search_terms)
     if cached_offers:
         return cached_offers
-    live_offers = find_live_merchant_offers(plan, search_terms)
-    if live_offers:
-        store_cached_item_lookup(plan, search_terms, live_offers)
-        return live_offers
     csv_offers = find_csv_direct_item_offers(plan, search_terms)
-    pricesapi_offers = find_pricesapi_offers(plan, search_terms, csv_offers)
-    if pricesapi_offers:
-        store_cached_item_lookup(plan, search_terms, pricesapi_offers)
-        return pricesapi_offers
-    brightdata_offers = find_brightdata_shopping_offers(plan, search_terms, csv_offers)
-    if brightdata_offers:
-        store_cached_item_lookup(plan, search_terms, brightdata_offers)
-        return brightdata_offers
+    source_fetchers: List[Tuple[str, Any]] = [
+        ("retailer_search_pages", lambda: find_live_merchant_offers(plan, search_terms)),
+        ("pricesapi_live_offers", lambda: find_pricesapi_offers(plan, search_terms, csv_offers)),
+        ("brightdata_google_shopping", lambda: find_brightdata_shopping_offers(plan, search_terms, csv_offers)),
+    ]
+    if stale_source_key:
+        source_fetchers.sort(key=lambda item: item[0] == stale_source_key)
+    for source_key, fetcher in source_fetchers:
+        offers = fetcher()
+        if not offers:
+            continue
+        if stale_source_key and source_key != stale_source_key:
+            for offer in offers:
+                offer["refreshed_after_stale_source"] = stale_source_key
+        store_cached_item_lookup(plan, search_terms, offers)
+        return offers
     if csv_offers:
         for offer in csv_offers:
             offer["live_lookup_attempted"] = True
@@ -2366,6 +2736,7 @@ def build_direct_item_reply(plan: Dict[str, Any], offers: List[Dict[str, Any]]) 
     source_url = direct_lookup_source_url(offers)
     cache_hit = any(bool(offer.get("cache_hit")) for offer in offers)
     live_lookup_attempted = any(bool(offer.get("live_lookup_attempted")) for offer in offers)
+    refreshed_after_stale_source = str(offers[0].get("refreshed_after_stale_source") or "") if offers else ""
     lines = [f"Need: {plan['query_label']}"]
     if terms:
         lines.append(f"Search terms: {', '.join(terms)}")
@@ -2390,6 +2761,8 @@ def build_direct_item_reply(plan: Dict[str, Any], offers: List[Dict[str, Any]]) 
         lines.append("Best retailer matches from community dataset:")
         if live_lookup_attempted:
             lines.append("Live retailer checks ran first but did not return a qualifying current match for this query.")
+    if refreshed_after_stale_source:
+        lines.append(f"Refreshed after 24-hour cache expiry by trying a different source before {refreshed_after_stale_source}.")
     lines.append(f"Comparison basis: {direct_lookup_comparison_basis(offers)}")
     for idx, offer in enumerate(offers, start=1):
         price_text = format_amount("GBP", offer.get("price_gbp"))
