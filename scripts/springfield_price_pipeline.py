@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import hmac
 import html
 import ipaddress
 import json
@@ -27,6 +28,13 @@ PRICESAPI_BASE_URL = os.getenv("SPRINGFIELD_PRICE_PRICESAPI_BASE_URL", "https://
 PRICESAPI_COUNTRY = os.getenv("SPRINGFIELD_PRICE_PRICESAPI_COUNTRY", "uk").strip().lower() or "uk"
 PRICESAPI_SEARCH_LIMIT = int(os.getenv("SPRINGFIELD_PRICE_PRICESAPI_SEARCH_LIMIT", "5"))
 PRICESAPI_PRODUCT_LIMIT = int(os.getenv("SPRINGFIELD_PRICE_PRICESAPI_PRODUCT_LIMIT", "3"))
+AMAZON_PAAPI_DOCS_URL = "https://webservices.amazon.com/paapi5/documentation/"
+AMAZON_PAAPI_HOST = os.getenv("SPRINGFIELD_PRICE_AMAZON_API_HOST", "webservices.amazon.co.uk").strip() or "webservices.amazon.co.uk"
+AMAZON_PAAPI_REGION = os.getenv("SPRINGFIELD_PRICE_AMAZON_API_REGION", "eu-west-1").strip() or "eu-west-1"
+AMAZON_PAAPI_MARKETPLACE = os.getenv("SPRINGFIELD_PRICE_AMAZON_API_MARKETPLACE", "www.amazon.co.uk").strip() or "www.amazon.co.uk"
+AMAZON_PAAPI_PARTNER_TYPE = os.getenv("SPRINGFIELD_PRICE_AMAZON_API_PARTNER_TYPE", "Associates").strip() or "Associates"
+AMAZON_PAAPI_SEARCH_INDEX = os.getenv("SPRINGFIELD_PRICE_AMAZON_API_SEARCH_INDEX", "All").strip() or "All"
+AMAZON_PAAPI_ITEM_LIMIT = int(os.getenv("SPRINGFIELD_PRICE_AMAZON_API_ITEM_LIMIT", "3"))
 BRIGHTDATA_GOOGLE_SHOPPING_DOCS_URL = "https://docs.brightdata.com/api-reference/serp/google-search/shopping"
 BRIGHTDATA_SERP_ENDPOINT = os.getenv("SPRINGFIELD_PRICE_BRIGHTDATA_SERP_ENDPOINT", "https://api.brightdata.com/request").strip() or "https://api.brightdata.com/request"
 BRIGHTDATA_SERP_COUNTRY = os.getenv("SPRINGFIELD_PRICE_BRIGHTDATA_SERP_COUNTRY", "UK").strip() or "UK"
@@ -86,12 +94,18 @@ TROLLEY_OFFER_RE = re.compile(
     r'<div class="_item">.*?class="store-logo\s+-([^"\s]+)[^"]*".*?<div class="_price">\s*<b>&pound;([0-9]+(?:\.[0-9]{1,2})?)</b>',
     re.IGNORECASE | re.DOTALL,
 )
+WANAHONG_PRODUCT_CARD_RE = re.compile(r'<article class="product-summary[^"]*".*?</article>', re.IGNORECASE | re.DOTALL)
+WANAHONG_NAME_RE = re.compile(r'<h5 class="product-summary-name">(.*?)</h5>', re.IGNORECASE | re.DOTALL)
+WANAHONG_LINK_RE = re.compile(r'<a href="([^"]+)"')
+WANAHONG_PRICE_RE = re.compile(r'<div class="product-summary-price">(.*?)</div>', re.IGNORECASE | re.DOTALL)
+WANAHONG_INS_PRICE_RE = re.compile(r"<ins[^>]*>(.*?)</ins>", re.IGNORECASE | re.DOTALL)
 LOCAL_FILE_FALSE_VALUES = {"0", "false", "no", "off"}
 _CACHE_DISABLED_VALUES = {"0", "false", "no", "off"}
 _CACHE_NAMESPACE_TTLS = {
     "html_url": "SPRINGFIELD_PRICE_CACHE_HTML_TTL_SEC",
     "json_url": "SPRINGFIELD_PRICE_CACHE_JSON_TTL_SEC",
     "pricesapi_json": "SPRINGFIELD_PRICE_CACHE_API_TTL_SEC",
+    "amazon_paapi_json": "SPRINGFIELD_PRICE_CACHE_API_TTL_SEC",
     "brightdata_shopping": "SPRINGFIELD_PRICE_CACHE_API_TTL_SEC",
     "item_lookup_result": "SPRINGFIELD_PRICE_CACHE_ITEM_TTL_SEC",
 }
@@ -110,17 +124,22 @@ QUERY_LABELS = {
 
 RETAILER_ALIASES = {
     "aldi": "Aldi",
+    "amazon": "Amazon UK",
+    "amazonuk": "Amazon UK",
     "asda": "ASDA",
     "coop": "Co-op",
     "co-op": "Co-op",
     "costco": "Costco",
     "iceland": "Iceland",
     "lidl": "Lidl",
+    "mands": "M&S",
+    "marksandspencer": "M&S",
     "morrisons": "Morrisons",
     "ocado": "Ocado",
     "sainsbury": "Sainsbury's",
     "sainsburys": "Sainsbury's",
     "tesco": "Tesco",
+    "wanahong": "Wanahong",
     "waitrose": "Waitrose",
 }
 BASKET_KEYWORDS = {"basket", "weekly", "shop", "shopping", "affordability", "affordable", "nutritious", "groceries", "grocery"}
@@ -338,6 +357,9 @@ DATASET_RETAILER_NAMES = {
 CANONICAL_RETAILER_NAMES = {
     "aldi": "Aldi",
     "aldiuk": "Aldi",
+    "amazon": "Amazon UK",
+    "amazoncouk": "Amazon UK",
+    "amazonuk": "Amazon UK",
     "asda": "ASDA",
     "asdagroceries": "ASDA",
     "coop": "Co-op",
@@ -366,21 +388,27 @@ TROLLEY_STORE_CLASS_MAP = {
     "co-op": "Co-op",
     "iceland": "Iceland",
     "lidl": "Lidl",
+    "mands": "M&S",
+    "marksandspencer": "M&S",
     "morrisons": "Morrisons",
     "morrisonsdaily": "Morrisons",
     "ocado": "Ocado",
     "sainsburys": "Sainsbury's",
     "tesco": "Tesco",
+    "wanahong": "Wanahong",
     "waitrose": "Waitrose",
 }
 RETAILER_HOST_NAMES = {
     "aldi.co.uk": "Aldi",
+    "amazon.co.uk": "Amazon UK",
     "costco.co.uk": "Costco",
     "groceries.asda.com": "ASDA",
+    "marksandspencer.com": "M&S",
     "morrisons.com": "Morrisons",
     "groceries.morrisons.com": "Morrisons",
     "sainsburys.co.uk": "Sainsbury's",
     "tesco.com": "Tesco",
+    "wanahong.co.uk": "Wanahong",
     "waitrose.com": "Waitrose",
 }
 MERCHANT_SEARCH_SOURCES = (
@@ -414,6 +442,14 @@ MERCHANT_SEARCH_SOURCES = (
         "parser": "costco_rest_json",
         "response_type": "json",
         "min_search_terms": 1,
+        "allow_broad_terms": False,
+    },
+    {
+        "name": "Wanahong",
+        "retailer": "Wanahong",
+        "search_url": "https://www.wanahong.co.uk/?s={query}&post_type=product",
+        "product_base_url": "https://www.wanahong.co.uk/",
+        "parser": "wanahong_woocommerce",
         "allow_broad_terms": False,
     },
 )
@@ -743,6 +779,7 @@ def cache_put(namespace: str, payload: Dict[str, Any], body_text: str, response_
 
 LIVE_ITEM_LOOKUP_SOURCE_KEYS = {
     "retailer_search_pages",
+    "amazon_api_live_offers",
     "pricesapi_live_offers",
     "brightdata_google_shopping",
 }
@@ -1796,6 +1833,196 @@ def score_pricesapi_product(result: Dict[str, Any], search_terms: List[str], req
     return score
 
 
+def amazon_paapi_access_key() -> str:
+    return os.getenv("SPRINGFIELD_PRICE_AMAZON_API_ACCESS_KEY", "").strip()
+
+
+def amazon_paapi_secret_key() -> str:
+    return os.getenv("SPRINGFIELD_PRICE_AMAZON_API_SECRET_KEY", "").strip()
+
+
+def amazon_paapi_partner_tag() -> str:
+    return os.getenv("SPRINGFIELD_PRICE_AMAZON_API_PARTNER_TAG", "").strip()
+
+
+def amazon_paapi_enabled() -> bool:
+    return bool(amazon_paapi_access_key() and amazon_paapi_secret_key() and amazon_paapi_partner_tag())
+
+
+def aws_sign_hmac(key: bytes, value: str) -> bytes:
+    return hmac.new(key, value.encode("utf-8"), hashlib.sha256).digest()
+
+
+def build_amazon_paapi_headers(path: str, target: str, payload_text: str) -> Dict[str, str]:
+    access_key = amazon_paapi_access_key()
+    secret_key = amazon_paapi_secret_key()
+    now = time.gmtime()
+    amz_date = time.strftime("%Y%m%dT%H%M%SZ", now)
+    date_stamp = time.strftime("%Y%m%d", now)
+    service = "ProductAdvertisingAPI"
+    canonical_headers = (
+        "content-encoding:amz-1.0\n"
+        "content-type:application/json; charset=utf-8\n"
+        f"host:{AMAZON_PAAPI_HOST}\n"
+        f"x-amz-date:{amz_date}\n"
+        f"x-amz-target:{target}\n"
+    )
+    signed_headers = "content-encoding;content-type;host;x-amz-date;x-amz-target"
+    payload_hash = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+    canonical_request = "\n".join(
+        [
+            "POST",
+            path,
+            "",
+            canonical_headers,
+            signed_headers,
+            payload_hash,
+        ]
+    )
+    credential_scope = f"{date_stamp}/{AMAZON_PAAPI_REGION}/{service}/aws4_request"
+    string_to_sign = "\n".join(
+        [
+            "AWS4-HMAC-SHA256",
+            amz_date,
+            credential_scope,
+            hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+        ]
+    )
+    k_date = aws_sign_hmac(("AWS4" + secret_key).encode("utf-8"), date_stamp)
+    k_region = aws_sign_hmac(k_date, AMAZON_PAAPI_REGION)
+    k_service = aws_sign_hmac(k_region, service)
+    k_signing = aws_sign_hmac(k_service, "aws4_request")
+    signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    authorization = (
+        f"AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+    return {
+        "Content-Encoding": "amz-1.0",
+        "Content-Type": "application/json; charset=utf-8",
+        "Host": AMAZON_PAAPI_HOST,
+        "X-Amz-Date": amz_date,
+        "X-Amz-Target": target,
+        "Authorization": authorization,
+        "User-Agent": DEFAULT_USER_AGENT,
+    }
+
+
+def fetch_amazon_paapi_json(path: str, target: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not amazon_paapi_enabled():
+        return {}
+    cache_payload = {"host": AMAZON_PAAPI_HOST, "path": path, "target": target, "payload": payload}
+    cached = cache_get("amazon_paapi_json", cache_payload)
+    if cached is not None:
+        body_text, _ = cached
+        try:
+            decoded = json.loads(body_text)
+        except ValueError:
+            decoded = {}
+        return decoded if isinstance(decoded, dict) else {}
+    payload_text = json.dumps(payload, sort_keys=True)
+    headers = build_amazon_paapi_headers(path, target, payload_text)
+    endpoint = f"https://{AMAZON_PAAPI_HOST}{path}"
+    response = requests.post(
+        endpoint,
+        headers=headers,
+        data=payload_text,
+        timeout=DEFAULT_TIMEOUT,
+    )
+    response.raise_for_status()
+    decoded = response.json()
+    cache_put("amazon_paapi_json", cache_payload, json.dumps(decoded, sort_keys=True), endpoint)
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def fetch_amazon_paapi_search_items(query: str) -> List[Dict[str, Any]]:
+    if not amazon_paapi_enabled():
+        return []
+    payload = {
+        "Keywords": query,
+        "ItemCount": AMAZON_PAAPI_ITEM_LIMIT,
+        "SearchIndex": AMAZON_PAAPI_SEARCH_INDEX,
+        "Marketplace": AMAZON_PAAPI_MARKETPLACE,
+        "PartnerTag": amazon_paapi_partner_tag(),
+        "PartnerType": AMAZON_PAAPI_PARTNER_TYPE,
+        "Resources": [
+            "ItemInfo.Title",
+            "Offers.Listings.Price",
+            "Offers.Summaries.LowestPrice",
+        ],
+    }
+    response_payload = fetch_amazon_paapi_json(
+        "/paapi5/searchitems",
+        "com.amazon.paapi5.v1.ProductAdvertisingAPIv1.SearchItems",
+        payload,
+    )
+    search_result = response_payload.get("SearchResult")
+    if not isinstance(search_result, dict):
+        return []
+    items = search_result.get("Items")
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def extract_amazon_paapi_price(item: Dict[str, Any]) -> Optional[float]:
+    offers = item.get("Offers")
+    if isinstance(offers, dict):
+        listings = offers.get("Listings")
+        if isinstance(listings, list):
+            for listing in listings:
+                if not isinstance(listing, dict):
+                    continue
+                price = listing.get("Price")
+                if not isinstance(price, dict):
+                    continue
+                currency = normalize_currency(str(price.get("Currency") or ""))
+                if currency and currency != "GBP":
+                    continue
+                amount = parse_amount(price.get("Amount"))
+                if amount is None:
+                    amount = parse_amount(price.get("DisplayAmount"))
+                if amount is not None:
+                    return amount
+        summaries = offers.get("Summaries")
+        if isinstance(summaries, list):
+            for summary in summaries:
+                if not isinstance(summary, dict):
+                    continue
+                lowest = summary.get("LowestPrice")
+                if not isinstance(lowest, dict):
+                    continue
+                currency = normalize_currency(str(lowest.get("Currency") or ""))
+                if currency and currency != "GBP":
+                    continue
+                amount = parse_amount(lowest.get("Amount"))
+                if amount is not None:
+                    return amount
+    return None
+
+
+def collect_amazon_paapi_offer(
+    item: Dict[str, Any],
+    search_terms: List[str],
+    requested_pack_count: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    detail_url = str(item.get("DetailPageURL") or "").strip()
+    item_info = item.get("ItemInfo")
+    title_info = item_info.get("Title") if isinstance(item_info, dict) else None
+    product_name = str(title_info.get("DisplayValue") if isinstance(title_info, dict) else "").strip()
+    if not product_name:
+        return None
+    price_gbp = extract_amazon_paapi_price(item)
+    return collect_live_offer(
+        "Amazon UK",
+        product_name,
+        price_gbp,
+        detail_url,
+        search_terms,
+        requested_pack_count=requested_pack_count,
+    )
+
+
 def build_brightdata_google_shopping_url(query: str) -> str:
     encoded_query = quote_plus(query)
     return f"https://{BRIGHTDATA_SERP_HOST}/search?q={encoded_query}&tbm=shop&gl={BRIGHTDATA_SERP_GEO}&hl={BRIGHTDATA_SERP_LANGUAGE}"
@@ -1925,8 +2152,6 @@ def find_pricesapi_offers(plan: Dict[str, Any], search_terms: List[str], csv_off
         return []
     shortlist = csv_retailer_shortlist(plan, csv_offers)
     shortlist_keys = {normalize_retailer_key(retailer) for retailer in shortlist}
-    if not shortlist_keys:
-        return []
     query = " ".join(search_terms).strip()
     if not query:
         return []
@@ -1978,6 +2203,34 @@ def find_pricesapi_offers(plan: Dict[str, Any], search_terms: List[str], csv_off
         source_key="pricesapi_live_offers",
         source_name="PricesAPI live offers",
         source_url=PRICESAPI_DOCS_URL,
+    )
+
+
+def find_amazon_api_offers(plan: Dict[str, Any], search_terms: List[str]) -> List[Dict[str, Any]]:
+    if not retailer_requested(plan, "Amazon UK"):
+        return []
+    if not amazon_paapi_enabled():
+        return []
+    query = " ".join(search_terms).strip()
+    if not query:
+        return []
+    try:
+        items = fetch_amazon_paapi_search_items(query)
+    except Exception:
+        return []
+    best_offer: Optional[Dict[str, Any]] = None
+    for item in items:
+        offer = collect_amazon_paapi_offer(item, search_terms, plan.get("requested_pack_count"))
+        if offer is None:
+            continue
+        best_offer = better_retailer_offer(best_offer, offer)
+    if best_offer is None:
+        return []
+    return annotate_lookup_source(
+        [best_offer],
+        source_key="amazon_api_live_offers",
+        source_name="Amazon Product Advertising API",
+        source_url=AMAZON_PAAPI_DOCS_URL,
     )
 
 
@@ -2227,6 +2480,48 @@ def parse_shopify_meta_results(
     return offers
 
 
+def parse_wanahong_price(price_block_html: str) -> Optional[float]:
+    ins_match = WANAHONG_INS_PRICE_RE.search(price_block_html)
+    if ins_match:
+        amount = parse_amount(html.unescape(strip_tags(ins_match.group(1))))
+        if amount is not None:
+            return amount
+    plain_text = html.unescape(strip_tags(price_block_html))
+    matches = AMOUNT_RE.findall(plain_text)
+    if not matches:
+        return None
+    return parse_amount(matches[-1])
+
+
+def parse_wanahong_woocommerce_results(
+    html_text: str,
+    source: Dict[str, str],
+    search_terms: List[str],
+    requested_pack_count: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    offers: List[Dict[str, Any]] = []
+    for card_html in WANAHONG_PRODUCT_CARD_RE.findall(html_text):
+        name_match = WANAHONG_NAME_RE.search(card_html)
+        link_match = WANAHONG_LINK_RE.search(card_html)
+        price_match = WANAHONG_PRICE_RE.search(card_html)
+        if not name_match or not link_match or not price_match:
+            continue
+        product_name = html.unescape(strip_tags(name_match.group(1))).strip()
+        product_url = urljoin(source["product_base_url"], html.unescape(link_match.group(1)).strip())
+        price_gbp = parse_wanahong_price(price_match.group(1))
+        offer = collect_live_offer(
+            source["name"],
+            product_name,
+            price_gbp,
+            product_url,
+            search_terms,
+            requested_pack_count=requested_pack_count,
+        )
+        if offer:
+            offers.append(offer)
+    return offers
+
+
 def trolley_retailer_from_store_class(store_class: str) -> str:
     normalized = normalize_retailer_key(store_class.replace("-", " "))
     mapped = TROLLEY_STORE_CLASS_MAP.get(normalized)
@@ -2417,6 +2712,7 @@ def find_live_merchant_offers(plan: Dict[str, Any], search_terms: List[str]) -> 
         "wlfdn_shopify": parse_wlfdn_shopify_results,
         "shopify_meta": parse_shopify_meta_results,
         "costco_rest_json": parse_costco_rest_results,
+        "wanahong_woocommerce": parse_wanahong_woocommerce_results,
     }
     best_by_retailer: Dict[str, Dict[str, Any]] = {}
     for source in MERCHANT_SEARCH_SOURCES:
@@ -2432,6 +2728,7 @@ def find_live_merchant_offers(plan: Dict[str, Any], search_terms: List[str]) -> 
         if parser is None:
             continue
         search_url = source["search_url"].format(query=query)
+        parsed_offers: List[Dict[str, Any]] = []
         try:
             if source.get("response_type") == "json":
                 payload, _ = fetch_json_url(search_url)
@@ -2671,11 +2968,10 @@ def find_direct_item_offers(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
     cached_offers, stale_source_key = load_item_lookup_cache_state(plan, search_terms)
     if cached_offers:
         return cached_offers
-    csv_offers = find_csv_direct_item_offers(plan, search_terms)
     source_fetchers: List[Tuple[str, Any]] = [
         ("retailer_search_pages", lambda: find_live_merchant_offers(plan, search_terms)),
-        ("pricesapi_live_offers", lambda: find_pricesapi_offers(plan, search_terms, csv_offers)),
-        ("brightdata_google_shopping", lambda: find_brightdata_shopping_offers(plan, search_terms, csv_offers)),
+        ("amazon_api_live_offers", lambda: find_amazon_api_offers(plan, search_terms)),
+        ("pricesapi_live_offers", lambda: find_pricesapi_offers(plan, search_terms, [])),
     ]
     if stale_source_key:
         source_fetchers.sort(key=lambda item: item[0] == stale_source_key)
@@ -2688,6 +2984,7 @@ def find_direct_item_offers(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
                 offer["refreshed_after_stale_source"] = stale_source_key
         store_cached_item_lookup(plan, search_terms, offers)
         return offers
+    csv_offers = find_csv_direct_item_offers(plan, search_terms)
     if csv_offers:
         for offer in csv_offers:
             offer["live_lookup_attempted"] = True
@@ -2716,7 +3013,7 @@ def direct_lookup_matched_sources(offers: List[Dict[str, Any]]) -> List[str]:
     if not offers:
         return []
     source_key = direct_lookup_source_key(offers)
-    if source_key in {"pricesapi_live_offers", "brightdata_google_shopping", "retailer_search_pages"}:
+    if source_key in {"amazon_api_live_offers", "pricesapi_live_offers", "brightdata_google_shopping", "retailer_search_pages"}:
         return ordered_unique(str(offer.get("retailer") or "") for offer in offers if offer.get("retailer"))
     return [SOURCE_MAP["community_supermarket_dataset"].name]
 
@@ -2734,6 +3031,7 @@ def build_direct_item_reply(plan: Dict[str, Any], offers: List[Dict[str, Any]]) 
     terms = extract_item_terms(plan)
     source_key = direct_lookup_source_key(offers)
     source_url = direct_lookup_source_url(offers)
+    shortlist_context = offers[0].get("csv_shortlist_retailers") or [] if offers else []
     cache_hit = any(bool(offer.get("cache_hit")) for offer in offers)
     live_lookup_attempted = any(bool(offer.get("live_lookup_attempted")) for offer in offers)
     refreshed_after_stale_source = str(offers[0].get("refreshed_after_stale_source") or "") if offers else ""
@@ -2743,17 +3041,19 @@ def build_direct_item_reply(plan: Dict[str, Any], offers: List[Dict[str, Any]]) 
     if plan.get("retailers"):
         lines.append(f"Retailers mentioned: {', '.join(plan['retailers'])}")
     lines.append("")
-    if source_key in {"pricesapi_live_offers", "brightdata_google_shopping"}:
+    if source_key in {"amazon_api_live_offers", "pricesapi_live_offers", "brightdata_google_shopping"}:
         shortlist = offers[0].get("csv_shortlist_retailers") or []
         missing = offers[0].get("csv_shortlist_missing_retailers") or []
-        if shortlist:
+        if source_key in {"pricesapi_live_offers", "brightdata_google_shopping"} and shortlist:
             lines.append(f"CSV-shortlisted retailers: {', '.join(str(item) for item in shortlist)}")
             lines.append("")
-        if source_key == "pricesapi_live_offers":
+        if source_key == "amazon_api_live_offers":
+            lines.append("Recent cached live offers from Amazon Product Advertising API:" if cache_hit else "Latest live offers from Amazon Product Advertising API:")
+        elif source_key == "pricesapi_live_offers":
             lines.append("Recent cached live offers from PricesAPI:" if cache_hit else "Latest live offers from PricesAPI:")
         else:
             lines.append("Recent cached live offers from Bright Data Google Shopping:" if cache_hit else "Latest live offers from Bright Data Google Shopping:")
-        if missing:
+        if source_key in {"pricesapi_live_offers", "brightdata_google_shopping"} and missing:
             lines.append(f"Live results not matched for: {', '.join(str(item) for item in missing)}")
     elif source_key == "retailer_search_pages":
         lines.append("Recent cached live offers from retailer search pages:" if cache_hit else "Best matched live offers from retailer search pages:")
@@ -2786,11 +3086,19 @@ def build_direct_item_reply(plan: Dict[str, Any], offers: List[Dict[str, Any]]) 
     else:
         lines.append("Source: live retailer search pages")
     lines.append("Caveats:")
-    if source_key == "pricesapi_live_offers":
+    if source_key == "amazon_api_live_offers":
         lines.extend(
             [
-                "- Reused a recent cached item lookup for the same query to reduce repeated API calls; prices may have changed since that fetch." if cache_hit else "- The retailer shortlist comes from the local Kaggle-derived CSV snapshot, then PricesAPI checks live offers for the shortlisted retailers when it can match them.",
-                "- PricesAPI uses its own product catalog and seller coverage, so some UK grocery retailers may not appear even if they were shortlisted from the CSV.",
+                "- Reused a recent cached item lookup for the same query to reduce repeated API calls; prices may have changed since that fetch." if cache_hit else "- Amazon offers come from the Amazon Product Advertising API (PA-API), not direct HTML scraping.",
+                "- Availability, shipping eligibility, and final checkout pricing can still differ by account and location.",
+                "- Verify the Amazon product page before checkout if pack size or seller matters.",
+            ]
+        )
+    elif source_key == "pricesapi_live_offers":
+        lines.extend(
+            [
+                "- Reused a recent cached item lookup for the same query to reduce repeated API calls; prices may have changed since that fetch." if cache_hit else "- The retailer shortlist comes from internal history records, then PricesAPI checks live offers for those shortlisted retailers when it can match them." if shortlist_context else "- PricesAPI checks live offers directly from your query terms when no retailer shortlist is available.",
+                "- PricesAPI uses its own product catalog and seller coverage, so some UK grocery retailers may not appear even if they were shortlisted from internal history.",
                 "- Verify the retailer page before checkout if the exact pack size or delivery terms matter.",
             ]
         )
@@ -2813,8 +3121,8 @@ def build_direct_item_reply(plan: Dict[str, Any], offers: List[Dict[str, Any]]) 
     else:
         lines.extend(
             [
-                "- Uses a locally converted CSV snapshot of the Kaggle-derived supermarket dataset, not an official statistic.",
-                "- These are the latest matched capture rows in the snapshot, not guaranteed live shelf prices today.",
+                "- Uses internal SQLite history records migrated from the Kaggle-derived supermarket CSV snapshot, not an official statistic.",
+                "- These are the latest matched capture rows in the internal history snapshot, not guaranteed live shelf prices today.",
                 "- Send a public product page URL if you want an exact live page-price extraction.",
             ]
         )
@@ -2839,8 +3147,14 @@ def extract_search_anchor(text: str, focus_terms: List[str], query_type: str) ->
     return DEFAULT_LOCATION_POSTCODE, True
 
 
+def normalize_retailer_mentions(text: str) -> str:
+    normalized = re.sub(r"\bm\s*&\s*s\b", "mands", text or "")
+    normalized = re.sub(r"\bmarks\s*(?:&|and)\s*spencer\b", "marksandspencer", normalized)
+    return normalized
+
+
 def classify_query(text: str) -> Dict[str, Any]:
-    lowered = (text or "").lower()
+    lowered = normalize_retailer_mentions((text or "").lower())
     tokens = WORD_RE.findall(lowered)
     token_set = set(tokens)
     retailers = ordered_unique(RETAILER_ALIASES[token] for token in tokens if token in RETAILER_ALIASES)

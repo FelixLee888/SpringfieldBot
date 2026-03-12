@@ -209,7 +209,7 @@ class SpringfieldPricePipelineTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(first[0]["shop"], "Tesco")
 
-    def test_pricesapi_lookup_uses_csv_shortlist_before_other_live_sources(self):
+    def test_pricesapi_lookup_runs_after_live_sources(self):
         with TemporaryDirectory() as tmpdir:
             csv_path = Path(tmpdir) / "community_supermarket_latest.csv"
             csv_path.write_text(
@@ -279,12 +279,10 @@ class SpringfieldPricePipelineTest(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(result.mode, "query")
         self.assertEqual(result.source, "PricesAPI live offers")
-        self.assertEqual(calls, [("search", "wagyu beef"), ("offers", "wagyu-1"), ("offers", "gift-box")])
-        self.assertIn("CSV-shortlisted retailers: Sainsbury's, Aldi, Tesco", result.reply_message)
+        self.assertEqual(calls, [("search", "wagyu beef"), ("offers", "wagyu-1")])
         self.assertIn("Latest live offers from PricesAPI", result.reply_message)
         self.assertIn("Tesco: Tesco Finest Wagyu Burger 340G - £4.75", result.reply_message)
         self.assertIn("Aldi: Specially Selected British Wagyu Beef Burgers 340g - £3.59", result.reply_message)
-        self.assertIn("Live results not matched for: Sainsbury's", result.reply_message)
         self.assertIn("PricesAPI checks live offers", result.reply_message)
 
     def test_retailer_search_pages_precede_pricesapi(self):
@@ -471,7 +469,7 @@ class SpringfieldPricePipelineTest(unittest.TestCase):
         self.assertEqual(offer["unit"], "each")
         self.assertAlmostEqual(offer["price_unit_gbp"], 0.46, places=2)
 
-    def test_brightdata_lookup_uses_csv_shortlist_before_live_shopping(self):
+    def test_brightdata_lookup_uses_csv_shortlist_for_retailer_queries(self):
         with TemporaryDirectory() as tmpdir:
             csv_path = Path(tmpdir) / "community_supermarket_latest.csv"
             csv_path.write_text(
@@ -483,7 +481,6 @@ class SpringfieldPricePipelineTest(unittest.TestCase):
             )
             old_path = module.COMMUNITY_DATASET_CSV_PATH
             old_fetch = module.fetch_brightdata_shopping_results
-            old_live = module.find_live_merchant_offers
             seen_queries = []
 
             def fake_fetch(query: str):
@@ -517,18 +514,17 @@ class SpringfieldPricePipelineTest(unittest.TestCase):
 
             module.COMMUNITY_DATASET_CSV_PATH = csv_path
             module.fetch_brightdata_shopping_results = fake_fetch
-            module.find_live_merchant_offers = lambda plan, search_terms: []
             module.os.environ["SPRINGFIELD_PRICE_BRIGHTDATA_API_KEY"] = "test-key"
             module.os.environ["SPRINGFIELD_PRICE_BRIGHTDATA_SERP_ZONE"] = "test-zone"
             try:
-                result = module.analyze_payload("Where to buy UK wagyu beef with best price?")
+                plan = module.classify_query("Where to buy UK wagyu beef with best price?")
+                terms = module.extract_item_terms(plan)
+                csv_offers = module.find_csv_direct_item_offers(plan, terms)
+                offers = module.find_brightdata_shopping_offers(plan, terms, csv_offers)
             finally:
                 module.COMMUNITY_DATASET_CSV_PATH = old_path
                 module.fetch_brightdata_shopping_results = old_fetch
-                module.find_live_merchant_offers = old_live
-        self.assertTrue(result.ok)
-        self.assertEqual(result.mode, "query")
-        self.assertEqual(result.source, "Bright Data Google Shopping")
+        self.assertEqual(len(offers), 2)
         self.assertEqual(
             seen_queries,
             [
@@ -537,12 +533,8 @@ class SpringfieldPricePipelineTest(unittest.TestCase):
                 "wagyu beef Tesco",
             ],
         )
-        self.assertIn("CSV-shortlisted retailers: Sainsbury's, Aldi, Tesco", result.reply_message)
-        self.assertIn("Latest live offers from Bright Data Google Shopping", result.reply_message)
-        self.assertIn("Sainsbury's: Finnebrogue Wagyu Beef Burgers x2 340g - £3.25", result.reply_message)
-        self.assertIn("Aldi: Specially Selected British Wagyu Beef Burgers 340g - £3.59", result.reply_message)
-        self.assertIn("Live results not matched for: Tesco", result.reply_message)
-        self.assertIn("Bright Data checks fresher Google Shopping offers", result.reply_message)
+        self.assertEqual(offers[0]["retailer"], "Sainsbury's")
+        self.assertEqual(offers[1]["retailer"], "Aldi")
 
 
     def test_live_merchant_lookup_returns_fresher_matches(self):
@@ -602,6 +594,10 @@ class SpringfieldPricePipelineTest(unittest.TestCase):
           <svg class="store-logo -asda"></svg>
           <div class="_price"><b>&pound;2.60</b></div>
         </div>
+        <div class="_item">
+          <svg class="store-logo -marksandspencer"></svg>
+          <div class="_price"><b>&pound;2.95</b></div>
+        </div>
         """
         old_fetch = module.fetch_url
 
@@ -624,12 +620,14 @@ class SpringfieldPricePipelineTest(unittest.TestCase):
             )
         finally:
             module.fetch_url = old_fetch
-        self.assertEqual(len(offers), 2)
+        self.assertEqual(len(offers), 3)
         by_retailer = {offer["retailer"]: offer for offer in offers}
         self.assertIn("Tesco", by_retailer)
         self.assertIn("ASDA", by_retailer)
+        self.assertIn("M&S", by_retailer)
         self.assertEqual(by_retailer["Tesco"]["price_gbp"], 2.85)
         self.assertEqual(by_retailer["ASDA"]["price_gbp"], 2.6)
+        self.assertEqual(by_retailer["M&S"]["price_gbp"], 2.95)
         self.assertEqual(by_retailer["Tesco"]["lookup_source_url"], "https://www.trolley.co.uk/")
 
     def test_trolley_live_supermarket_results_precede_csv_fallback(self):
@@ -674,6 +672,86 @@ class SpringfieldPricePipelineTest(unittest.TestCase):
         self.assertIn("Tesco: Tesco Medium Free Range Eggs x12 - £2.85", result.reply_message)
         self.assertIn("Source: https://www.trolley.co.uk/", result.reply_message)
 
+    def test_wanahong_woocommerce_parser_extracts_offers(self):
+        html_text = """
+        <div class="products">
+          <article class="product-summary product type-product">
+            <a href="https://www.wanahong.co.uk/product/oct-5-phoenix-egg-rolls-with-coconut-shreds-150g/">
+              <div class="product-summary-details">
+                <h5 class="product-summary-name">OCT-5 Phoenix Egg Rolls with Coconut Shreds 150g</h5>
+                <div class="product-summary-price">
+                  <del><span class="woocommerce-Price-amount amount"><bdi><span class="woocommerce-Price-currencySymbol">&pound;</span>4.99</bdi></span></del>
+                  <ins><span class="woocommerce-Price-amount amount"><bdi><span class="woocommerce-Price-currencySymbol">&pound;</span>3.99</bdi></span></ins>
+                </div>
+              </div>
+            </a>
+          </article>
+          <article class="product-summary product type-product">
+            <a href="/product/salted-duck-eggs/">
+              <div class="product-summary-details">
+                <h5 class="product-summary-name">Salted Duck Eggs (6 pack)</h5>
+                <div class="product-summary-price"><span class="woocommerce-Price-amount amount"><bdi><span class="woocommerce-Price-currencySymbol">&pound;</span>2.69</bdi></span></div>
+              </div>
+            </a>
+          </article>
+        </div>
+        """
+        offers = module.parse_wanahong_woocommerce_results(
+            html_text,
+            {
+                "name": "Wanahong",
+                "search_url": "https://www.wanahong.co.uk/?s={query}&post_type=product",
+                "product_base_url": "https://www.wanahong.co.uk/",
+            },
+            ["egg"],
+            requested_pack_count=None,
+        )
+        self.assertEqual(len(offers), 2)
+        by_name = {offer["product_name"]: offer for offer in offers}
+        self.assertEqual(by_name["OCT-5 Phoenix Egg Rolls with Coconut Shreds 150g"]["price_gbp"], 3.99)
+        self.assertEqual(by_name["Salted Duck Eggs (6 pack)"]["price_gbp"], 2.69)
+        self.assertEqual(by_name["Salted Duck Eggs (6 pack)"]["product_url"], "https://www.wanahong.co.uk/product/salted-duck-eggs/")
+        self.assertEqual(by_name["Salted Duck Eggs (6 pack)"]["retailer"], "Wanahong")
+
+    def test_amazon_paapi_lookup_returns_offers(self):
+        old_access = module.os.environ.get("SPRINGFIELD_PRICE_AMAZON_API_ACCESS_KEY")
+        old_secret = module.os.environ.get("SPRINGFIELD_PRICE_AMAZON_API_SECRET_KEY")
+        old_tag = module.os.environ.get("SPRINGFIELD_PRICE_AMAZON_API_PARTNER_TAG")
+        old_fetch = module.fetch_amazon_paapi_search_items
+        module.os.environ["SPRINGFIELD_PRICE_AMAZON_API_ACCESS_KEY"] = "amz-access"
+        module.os.environ["SPRINGFIELD_PRICE_AMAZON_API_SECRET_KEY"] = "amz-secret"
+        module.os.environ["SPRINGFIELD_PRICE_AMAZON_API_PARTNER_TAG"] = "partner-20"
+        module.fetch_amazon_paapi_search_items = lambda query: [
+            {
+                "DetailPageURL": "https://www.amazon.co.uk/dp/B001EGGS12",
+                "ItemInfo": {"Title": {"DisplayValue": "Acme Free Range Eggs x12"}},
+                "Offers": {"Listings": [{"Price": {"Amount": 2.49, "Currency": "GBP"}}]},
+            }
+        ]
+        try:
+            plan = module.classify_query("Find Amazon eggs price")
+            terms = module.extract_item_terms(plan)
+            offers = module.find_amazon_api_offers(plan, terms)
+        finally:
+            module.fetch_amazon_paapi_search_items = old_fetch
+            if old_access is None:
+                module.os.environ.pop("SPRINGFIELD_PRICE_AMAZON_API_ACCESS_KEY", None)
+            else:
+                module.os.environ["SPRINGFIELD_PRICE_AMAZON_API_ACCESS_KEY"] = old_access
+            if old_secret is None:
+                module.os.environ.pop("SPRINGFIELD_PRICE_AMAZON_API_SECRET_KEY", None)
+            else:
+                module.os.environ["SPRINGFIELD_PRICE_AMAZON_API_SECRET_KEY"] = old_secret
+            if old_tag is None:
+                module.os.environ.pop("SPRINGFIELD_PRICE_AMAZON_API_PARTNER_TAG", None)
+            else:
+                module.os.environ["SPRINGFIELD_PRICE_AMAZON_API_PARTNER_TAG"] = old_tag
+        self.assertEqual(len(offers), 1)
+        self.assertEqual(offers[0]["retailer"], "Amazon UK")
+        self.assertEqual(offers[0]["lookup_source_key"], "amazon_api_live_offers")
+        self.assertEqual(offers[0]["price_gbp"], 2.49)
+        self.assertEqual(offers[0]["product_url"], "https://www.amazon.co.uk/dp/B001EGGS12")
+
     def test_csv_snapshot_lookup_returns_best_matches_when_live_search_unavailable(self):
         with TemporaryDirectory() as tmpdir:
             csv_path = Path(tmpdir) / "community_supermarket_latest.csv"
@@ -696,7 +774,7 @@ class SpringfieldPricePipelineTest(unittest.TestCase):
         self.assertEqual(result.mode, "query")
         self.assertEqual(result.source, "Community UK supermarket time-series dataset")
         self.assertIn("Tesco Finest Wagyu Beef Burger - £6.50 (£13.00/kg)", result.reply_message)
-        self.assertIn("Uses a locally converted CSV snapshot", result.reply_message)
+        self.assertIn("Uses internal SQLite history records migrated", result.reply_message)
 
     def test_csv_snapshot_lookup_filters_to_named_retailers(self):
         with TemporaryDirectory() as tmpdir:
@@ -734,6 +812,60 @@ class SpringfieldPricePipelineTest(unittest.TestCase):
         self.assertIn("eggs", plan["focus_terms"])
         self.assertNotIn("preparing", plan["focus_terms"])
         self.assertNotIn("dinner", plan["focus_terms"])
+
+    def test_marks_and_spencer_aliases_are_detected_as_ms(self):
+        plan_symbol = module.classify_query("What is the M&S eggs price today?")
+        plan_words = module.classify_query("What is the Marks and Spencer eggs price today?")
+        self.assertIn("M&S", plan_symbol["retailers"])
+        self.assertIn("M&S", plan_words["retailers"])
+
+    def test_wanahong_alias_is_detected(self):
+        plan = module.classify_query("Find Wanahong eggs price today")
+        self.assertIn("Wanahong", plan["retailers"])
+
+    def test_amazon_alias_is_detected(self):
+        plan = module.classify_query("Find eggs on amazon.co.uk today")
+        self.assertIn("Amazon UK", plan["retailers"])
+
+    def test_direct_lookup_uses_amazon_api_before_pricesapi_and_history(self):
+        plan = module.classify_query("Find Amazon eggs price")
+        old_cache_state = module.load_item_lookup_cache_state
+        old_live = module.find_live_merchant_offers
+        old_amazon = module.find_amazon_api_offers
+        old_prices = module.find_pricesapi_offers
+        old_csv = module.find_csv_direct_item_offers
+        calls = []
+
+        module.load_item_lookup_cache_state = lambda p, t: ([], "")
+        module.find_live_merchant_offers = lambda p, t: calls.append("live") or []
+        module.find_amazon_api_offers = lambda p, t: calls.append("amazon_api") or [
+            {
+                "retailer": "Amazon UK",
+                "product_name": "Acme Free Range Eggs x12",
+                "price_gbp": 2.49,
+                "price_unit_gbp": None,
+                "unit": "",
+                "score": 3,
+                "product_url": "https://www.amazon.co.uk/dp/B001EGGS12",
+                "lookup_source_key": "amazon_api_live_offers",
+                "lookup_source_name": "Amazon Product Advertising API",
+                "lookup_source_url": module.AMAZON_PAAPI_DOCS_URL,
+            }
+        ]
+        module.find_pricesapi_offers = lambda p, t, c: calls.append("pricesapi") or (_ for _ in ()).throw(
+            AssertionError("pricesapi should not run when amazon api already matched")
+        )
+        module.find_csv_direct_item_offers = lambda p, t: calls.append("history") or []
+        try:
+            offers = module.find_direct_item_offers(plan)
+        finally:
+            module.load_item_lookup_cache_state = old_cache_state
+            module.find_live_merchant_offers = old_live
+            module.find_amazon_api_offers = old_amazon
+            module.find_pricesapi_offers = old_prices
+            module.find_csv_direct_item_offers = old_csv
+        self.assertEqual(calls, ["live", "amazon_api"])
+        self.assertEqual(offers[0]["lookup_source_key"], "amazon_api_live_offers")
 
     def test_cached_item_lookup_short_circuits_live_and_csv(self):
         old_cache_state = module.load_item_lookup_cache_state
@@ -817,12 +949,13 @@ class SpringfieldPricePipelineTest(unittest.TestCase):
             connection.close()
 
         old_live = module.find_live_merchant_offers
+        old_amazon = module.find_amazon_api_offers
         old_prices = module.find_pricesapi_offers
-        old_bright = module.find_brightdata_shopping_offers
         old_csv = module.find_csv_direct_item_offers
         calls = []
 
         module.find_live_merchant_offers = lambda p, t: calls.append("live") or []
+        module.find_amazon_api_offers = lambda p, t: calls.append("amazon_api") or []
         module.find_csv_direct_item_offers = lambda p, t: [
             {
                 "retailer": "Tesco",
@@ -850,17 +983,16 @@ class SpringfieldPricePipelineTest(unittest.TestCase):
                 "lookup_source_url": module.PRICESAPI_DOCS_URL,
             }
         ]
-        module.find_brightdata_shopping_offers = lambda p, t, c: calls.append("brightdata") or []
         try:
             offers = module.find_direct_item_offers(plan)
         finally:
             module.find_live_merchant_offers = old_live
+            module.find_amazon_api_offers = old_amazon
             module.find_pricesapi_offers = old_prices
-            module.find_brightdata_shopping_offers = old_bright
             module.find_csv_direct_item_offers = old_csv
 
         self.assertTrue(offers)
-        self.assertEqual(calls[0], "pricesapi")
+        self.assertEqual(calls, ["amazon_api", "pricesapi"])
         self.assertEqual(offers[0]["lookup_source_key"], "pricesapi_live_offers")
         self.assertEqual(offers[0]["refreshed_after_stale_source"], "retailer_search_pages")
         connection = module.open_cache_db()

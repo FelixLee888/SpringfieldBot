@@ -10,9 +10,9 @@ Springfield Price Bot is an OpenClaw-compatible Telegram bot workspace for UK fo
 - Migrates CSV snapshot rows into SQLite history tables so CSV fallback is managed from one central store.
 - Uses the Kaggle-derived CSV snapshot as the final fallback when live sources cannot return a qualifying match.
 - Normalizes price-per-unit comparison where possible, so results can rank on `£/kg`, `£/l`, or `£/each` instead of only shelf price.
-- Attempts live item-level retailer comparisons from reachable retailer search pages or retailer JSON search endpoints next, including live supermarket comparisons through Trolley.
-- Uses PricesAPI after retailer search pages when credentials are configured and the live retailer-page path does not yield a usable match.
-- Keeps Bright Data Google Shopping as a later live-offer path when PricesAPI is unavailable or does not return usable matches.
+- Attempts live item-level retailer comparisons from reachable retailer search pages or retailer JSON search endpoints first (excluding Amazon HTML scraping), including live supermarket comparisons through Trolley.
+- Uses Amazon Product Advertising API next for Amazon UK offers when credentials are configured.
+- Uses PricesAPI after Amazon API when earlier live stages do not yield a usable match.
 - Prioritizes official UK statistics when the user asks for government or official sources.
 - Highlights the tradeoff between official averages, basket trackers, and community-scraped retailer data.
 - Keeps public product page URL and pasted HTML extraction as a fallback for exact current page-price lookups.
@@ -34,8 +34,8 @@ The bot treats these differently:
 - Official ONS and GOV sources are best for trends, averages, and policy-grade context.
 - Food Foundation is best for weekly basket affordability.
 - Community retailer datasets are best for supermarket-to-supermarket value checks and price-per-unit comparisons.
+- Amazon Product Advertising API is the preferred Amazon path to avoid anti-automation failures from direct page scraping.
 - PricesAPI is useful for low-cost live offer checks, but its seller coverage is catalog-dependent and may not include every UK grocery retailer.
-- Bright Data Google Shopping is best for fresher live offer checks once the CSV shortlist identifies which retailers are worth probing.
 - For specialist and supermarket live-product searches, the bot can scrape reachable retailer search pages and retailer JSON search endpoints (including Trolley's supermarket comparison pages), then return current product links.
 - The Pi-compatible snapshot fallback reads a locally built CSV file, so the runtime does not need parquet readers or Kaggle credentials.
 - Geolytix helps find nearby stores, but it is not a price feed.
@@ -45,7 +45,7 @@ The bot treats these differently:
 
 ```text
 scripts/
-  springfield_price_pipeline.py   # Query routing + CSV + live search page + PricesAPI/Bright Data lookup
+  springfield_price_pipeline.py   # Query routing + live search pages + Amazon API + PricesAPI + internal history lookup
   run_telegram_bot.py             # Standalone Telegram polling runner
   build_supermarket_latest_csv.py # Local parquet-to-CSV snapshot builder
 tests/
@@ -93,33 +93,34 @@ Optional:
 - `SPRINGFIELD_PRICE_CACHE_TTL_SEC` default cache freshness window in seconds, default `14400`
 - `SPRINGFIELD_PRICE_CACHE_HTML_TTL_SEC` optional HTML cache TTL override
 - `SPRINGFIELD_PRICE_CACHE_JSON_TTL_SEC` optional JSON page cache TTL override
-- `SPRINGFIELD_PRICE_CACHE_API_TTL_SEC` optional API cache TTL override for PricesAPI and Bright Data
+- `SPRINGFIELD_PRICE_CACHE_API_TTL_SEC` optional API cache TTL override for Amazon API and PricesAPI
 - `SPRINGFIELD_PRICE_CACHE_ITEM_TTL_SEC` optional item-lookup cache TTL override, default `86400` (24 hours)
+- `SPRINGFIELD_PRICE_AMAZON_API_ACCESS_KEY` Amazon Product Advertising API access key
+- `SPRINGFIELD_PRICE_AMAZON_API_SECRET_KEY` Amazon Product Advertising API secret key
+- `SPRINGFIELD_PRICE_AMAZON_API_PARTNER_TAG` Amazon Associates partner tag
+- `SPRINGFIELD_PRICE_AMAZON_API_HOST` optional, defaults to `webservices.amazon.co.uk`
+- `SPRINGFIELD_PRICE_AMAZON_API_REGION` optional, defaults to `eu-west-1`
+- `SPRINGFIELD_PRICE_AMAZON_API_MARKETPLACE` optional, defaults to `www.amazon.co.uk`
+- `SPRINGFIELD_PRICE_AMAZON_API_SEARCH_INDEX` optional, defaults to `All`
 - `SPRINGFIELD_PRICE_PRICESAPI_KEY` PricesAPI key for live catalog/offers lookup
 - `SPRINGFIELD_PRICE_PRICESAPI_COUNTRY` optional, defaults to `uk`
-- `SPRINGFIELD_PRICE_BRIGHTDATA_API_KEY` Bright Data API token for live Google Shopping lookups
-- `SPRINGFIELD_PRICE_BRIGHTDATA_SERP_ZONE` Bright Data SERP API zone name
-- `SPRINGFIELD_PRICE_BRIGHTDATA_SERP_COUNTRY` optional, defaults to `UK`
-- `SPRINGFIELD_PRICE_BRIGHTDATA_SERP_HOST` optional, defaults to `www.google.com`
-- `SPRINGFIELD_PRICE_BRIGHTDATA_SERP_LANGUAGE` optional, defaults to `en`
-- `SPRINGFIELD_PRICE_BRIGHTDATA_SERP_GEO` optional, defaults to `gb`
 - `SPRINGFIELD_PRICE_TROLLEY_PRODUCT_FETCH_LIMIT` optional, defaults to `6`
 
 The direct item lookup order is:
 
 1. recent item-level cache hit (if available)
-2. after item-cache expiry, refresh by trying a different live source first
-3. PricesAPI live offers for the top CSV retailers when configured
-4. Bright Data Google Shopping live offers for the top CSV retailers when configured
-5. reachable live retailer/supermarket sources (including Trolley)
-6. CSV snapshot fallback (served from migrated SQLite history rows)
+2. other live retailer/supermarket sources (excluding Amazon HTML scraping)
+3. Amazon Product Advertising API
+4. PricesAPI live offers
+5. internal history records lookup (served from migrated SQLite history rows)
 
 Current live retailer-search sources:
 
-- Trolley UK supermarket comparison pages
+- Trolley UK supermarket comparison pages (including M&S where available)
 - Tom Hixson
 - Fine Food Specialist
 - Costco UK via `rest/v2/uk/products/search`, with a product-page price fallback when the JSON search result omits price
+- Wanahong UK via WooCommerce product search (`/?s=...&post_type=product`)
 
 Recent live searches are cached in SQLite so repeated item lookups do not refetch the same retailer pages and API responses over and over again. Stale item-cache entries are archived into `price_history` before deletion, and CSV rows are migrated into the same SQLite history domain (tracked by `history_import_state`) for centralized management.
 
@@ -194,7 +195,7 @@ python3 scripts/run_telegram_bot.py
 ```
 
 The polling runner stores the last Telegram update offset at `data/telegram_offset.txt`.
-It already loads `.env`, so Bright Data credentials placed there are available to the pipeline.
+It already loads `.env`, so Amazon API and PricesAPI credentials placed there are available to the pipeline.
 
 ## OpenClaw Integration
 
@@ -225,7 +226,7 @@ UK food price intelligence bot
 
 - Official sources in this bot are trend and context tools, not live checkout feeds.
 - Community retailer datasets are useful for operational price comparison, but they are not official statistics.
-- Bright Data live offer checks are fresher than the CSV snapshot, but they depend on Google Shopping and merchant-feed coverage.
+- Amazon Product Advertising API avoids Amazon anti-automation scrape failures, but still depends on valid Associates credentials and API policies.
 - PricesAPI live offer checks are also fresher than the CSV snapshot, but the API does not guarantee coverage for every UK supermarket in the shortlist.
 - Live retailer search-page matches can be fresher, but they depend on each retailer exposing parseable search HTML or JSON or being reachable through Trolley-style comparison pages.
 - Value ranking compares standardized unit price first when the item size is known, then falls back to shelf price.
