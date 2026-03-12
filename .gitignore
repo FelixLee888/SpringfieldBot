@@ -1,0 +1,6 @@
+.env
+__pycache__/
+.pytest_cache/
+.venv/
+logs/
+data/telegram_offset.txt

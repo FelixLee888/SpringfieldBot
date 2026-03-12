@@ -1,0 +1,20 @@
+{
+  "agents": {
+    "list": [
+      {
+        "id": "springfield-price",
+        "workspace": "/Users/felixlee/Documents/SpringfieldPriceBot"
+      }
+    ]
+  },
+  "routes": {
+    "enabled": true,
+    "bindings": [
+      {
+        "type": "keyword",
+        "pattern": "#springfield-price",
+        "targetAgentId": "springfield-price"
+      }
+    ]
+  }
+}
